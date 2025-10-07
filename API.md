@@ -15,8 +15,16 @@ Headers:
 ### GET `/`
 Serves the main game UI (HTML page).
 
+```bash
+curl http://localhost:5000/
+```
+
 ### GET `/public`
 Returns public game information.
+
+```bash
+curl http://localhost:5000/public
+```
 
 **Response:**
 ```json
@@ -32,12 +40,10 @@ Returns public game information.
 ### POST `/signup`
 Create a new user account.
 
-**Request:**
-```json
-{
-  "username": "player1",
-  "password": "secret123"
-}
+```bash
+curl -X POST http://localhost:5000/signup \
+  -H "Content-Type: application/json" \
+  -d '{"username": "player1", "password": "secret123"}'
 ```
 
 **Response:**
@@ -52,12 +58,10 @@ Create a new user account.
 ### POST `/login`
 Login to existing account.
 
-**Request:**
-```json
-{
-  "username": "player1",
-  "password": "secret123"
-}
+```bash
+curl -X POST http://localhost:5000/login \
+  -H "Content-Type: application/json" \
+  -d '{"username": "player1", "password": "secret123"}'
 ```
 
 **Response:**
@@ -73,6 +77,11 @@ Login to existing account.
 
 ### GET `/rules`
 Returns game configuration and rules.
+
+```bash
+curl http://localhost:5000/rules \
+  -H "api_key: your_api_key_here"
+```
 
 **Response:**
 ```json
@@ -90,6 +99,11 @@ Returns game configuration and rules.
 
 ### GET `/state`
 Returns current user's submarines and torpedoes.
+
+```bash
+curl http://localhost:5000/state \
+  -H "api_key: your_api_key_here"
+```
 
 **Response:**
 ```json
@@ -124,11 +138,11 @@ Returns current user's submarines and torpedoes.
 ### POST `/register_sub`
 Spawn a new submarine.
 
-**Request:**
-```json
-{
-  "name": "USS Hunter"
-}
+```bash
+curl -X POST http://localhost:5000/register_sub \
+  -H "api_key: your_api_key_here" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "USS Hunter"}'
 ```
 
 **Response:**
@@ -145,14 +159,11 @@ Spawn a new submarine.
 ### POST `/control/<sub_id>`
 Control submarine movement and systems.
 
-**Request:**
-```json
-{
-  "throttle": 0.8,
-  "rudder": 0.3,
-  "planes": -0.2,
-  "target_depth": 150.0
-}
+```bash
+curl -X POST http://localhost:5000/control/sub123 \
+  -H "api_key: your_api_key_here" \
+  -H "Content-Type: application/json" \
+  -d '{"throttle": 0.8, "rudder": 0.3, "planes": -0.2, "target_depth": 150.0}'
 ```
 
 **Response:**
@@ -171,21 +182,21 @@ Control submarine movement and systems.
 ### POST `/snorkel/<sub_id>`
 Toggle snorkel mode for battery charging.
 
-**Request:**
-```json
-{
-  "active": true
-}
+```bash
+curl -X POST http://localhost:5000/snorkel/sub123 \
+  -H "api_key: your_api_key_here" \
+  -H "Content-Type: application/json" \
+  -d '{"active": true}'
 ```
 
 ### POST `/emergency_blow/<sub_id>`
 Activate emergency surface system.
 
-**Request:**
-```json
-{
-  "activate": true
-}
+```bash
+curl -X POST http://localhost:5000/emergency_blow/sub123 \
+  -H "api_key: your_api_key_here" \
+  -H "Content-Type: application/json" \
+  -d '{"activate": true}'
 ```
 
 ## Sonar Operations
@@ -193,22 +204,21 @@ Activate emergency surface system.
 ### POST `/set_passive_array/<sub_id>`
 Set passive sonar listening direction.
 
-**Request:**
-```json
-{
-  "dir_deg": 45.0
-}
+```bash
+curl -X POST http://localhost:5000/set_passive_array/sub123 \
+  -H "api_key: your_api_key_here" \
+  -H "Content-Type: application/json" \
+  -d '{"dir_deg": 45.0}'
 ```
 
 ### POST `/ping/<sub_id>`
 Send active sonar ping.
 
-**Request:**
-```json
-{
-  "bearing_deg": 90.0,
-  "range_m": 2000.0
-}
+```bash
+curl -X POST http://localhost:5000/ping/sub123 \
+  -H "api_key: your_api_key_here" \
+  -H "Content-Type: application/json" \
+  -d '{"bearing_deg": 90.0, "range_m": 2000.0}'
 ```
 
 **Response:**
@@ -230,12 +240,11 @@ Send active sonar ping.
 ### POST `/launch_torpedo/<sub_id>`
 Launch a torpedo from submarine.
 
-**Request:**
-```json
-{
-  "tube": 0,
-  "wire_length": 600.0
-}
+```bash
+curl -X POST http://localhost:5000/launch_torpedo/sub123 \
+  -H "api_key: your_api_key_here" \
+  -H "Content-Type: application/json" \
+  -d '{"tube": 0, "wire_length": 600.0}'
 ```
 
 **Response:**
@@ -251,31 +260,28 @@ Launch a torpedo from submarine.
 ### POST `/set_torp_depth/<torp_id>`
 Set torpedo target depth.
 
-**Request:**
-```json
-{
-  "depth": 120.0
-}
+```bash
+curl -X POST http://localhost:5000/set_torp_depth/torp456 \
+  -H "api_key: your_api_key_here" \
+  -H "Content-Type: application/json" \
+  -d '{"depth": 120.0}'
 ```
 
 ### POST `/set_torp_heading/<torp_id>`
 Control torpedo heading.
 
-**Request:**
-```json
-{
-  "turn_deg": 15.0,
-  "dt": 1.0
-}
-```
+```bash
+# Relative turn
+curl -X POST http://localhost:5000/set_torp_heading/torp456 \
+  -H "api_key: your_api_key_here" \
+  -H "Content-Type: application/json" \
+  -d '{"turn_deg": 15.0, "dt": 1.0}'
 
-**OR**
-
-```json
-{
-  "heading_deg": 90.0,
-  "dt": 1.0
-}
+# Absolute heading
+curl -X POST http://localhost:5000/set_torp_heading/torp456 \
+  -H "api_key: your_api_key_here" \
+  -H "Content-Type: application/json" \
+  -d '{"heading_deg": 90.0, "dt": 1.0}'
 ```
 
 **Parameters:**
@@ -285,6 +291,12 @@ Control torpedo heading.
 
 ### POST `/detonate/<torp_id>`
 Manually detonate torpedo.
+
+```bash
+curl -X POST http://localhost:5000/detonate/torp456 \
+  -H "api_key: your_api_key_here" \
+  -H "Content-Type: application/json"
+```
 
 **Response:**
 ```json
@@ -301,8 +313,10 @@ Manually detonate torpedo.
 ### GET `/stream`
 Server-Sent Events stream for real-time game updates.
 
-**Query Parameters:**
-- `api_key`: Authentication key
+```bash
+curl http://localhost:5000/stream?api_key=your_api_key_here \
+  -H "Accept: text/event-stream"
+```
 
 **Event Types:**
 
@@ -356,6 +370,11 @@ Passive sonar detection:
 
 ### GET `/admin/state`
 Admin-only endpoint for full game state (requires admin privileges).
+
+```bash
+curl http://localhost:5000/admin/state \
+  -H "api_key: admin_api_key_here"
+```
 
 ## Error Responses
 
