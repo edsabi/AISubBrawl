@@ -1,0 +1,62 @@
+{
+  "tick_hz": 10,
+
+  "world": {
+    "ring": { "x": 0.0, "y": 0.0, "r": 6000.0 },
+    "spawn_min_r": 500.0,
+    "spawn_max_r": 4500.0,
+    "safe_spawn_separation": 800.0
+  },
+
+  "sub": {
+    "max_speed": 6.0,
+    "yaw_rate_deg_s": 20.0,
+    "pitch_rate_deg_s": 12.0,
+    "planes_effect": 1.0,
+    "neutral_bias": 0.008,
+    "depth_damping": 0.35,
+    "snorkel_depth": 15.0,
+
+    "emergency_blow": {
+      "duration_s": 10.0,
+      "upward_mps": 5.0,
+      "recharge_per_s_at_snorkel": 0.06,
+      "cooldown_s": 0.0
+    },
+
+    "battery": {
+      "initial_min": 55.0,
+      "initial_max": 90.0,
+      "drain_per_throttle_per_s": 0.02,
+      "recharge_per_s_snorkel": 0.25
+    },
+
+    "crush_depth": 500.0,
+    "crush_dps_per_100m": 30.0
+  },
+
+  "torpedo": {
+    "speed": 36.0,
+    "turn_rate_deg_s": 30.0,
+    "depth_rate_m_s": 6.0,
+    "blast_radius": 200,
+    "lifetime_s": 240.0,
+    "default_wire": 600.0
+  },
+
+  "sonar": {
+    "passive": {
+      "base_snr": 8.0,
+      "speed_noise_gain": 0.6,
+      "snorkel_bonus": 8.0,
+      "bearing_jitter_deg": 3.0,
+      "report_interval_s": [2.0, 4.0]
+    },
+    "active": {
+      "max_range": 6000.0,
+      "sound_speed": 1500.0,
+      "rng_sigma_m": 40.0,
+      "brg_sigma_deg": 1.5
+    }
+  }
+}
