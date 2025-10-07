@@ -1,0 +1,661 @@
+
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"/>
+<title>Sub Brawl Command</title>
+<style>
+:root{--bg:#020b16;--fg:#d8e4ee;--muted:#8ea3b7;--accent:#1e90ff;--panel:#071425;--card:#0c1a2b;}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font-family:ui-monospace,monospace;display:flex;flex-direction:column;height:100vh}
+header{background:#041120;padding:8px 10px}
+header .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+input,select,button{height:34px;border-radius:7px;border:1px solid #2c3f57;background:#0e1b2a;color:#fff;padding:0 10px}
+button{background:#123a66;border-color:#2c3f57;cursor:pointer}
+button.primary{background:var(--accent);border-color:#2c3f57}
+button.ghost{background:#0e1b2a}
+#mapWrap{position:relative}
+canvas{background:#000;width:100%;height:54vh;touch-action:none;display:block}
+#mapUI{position:absolute;top:8px;right:8px;display:flex;flex-direction:column;gap:6px;align-items:flex-end}
+#mapUI button{width:38px;height:38px;padding:0}
+#mapUI .pad{display:grid;grid-template-columns:38px 38px 38px;gap:6px;justify-content:center}
+#tabbar{display:flex;gap:8px;background:#061327;border-top:1px solid #132743;padding:6px}
+.tab{flex:1;text-align:center;padding:8px 0;border-radius:8px;background:#0b1930;border:1px solid #1b2f4a;color:#bcd0e4}
+.tab.active{background:#173258;color:#fff}
+#pages{flex:1;overflow:auto;background:var(--panel)}
+.page{display:none;padding:10px}
+.page.active{display:block}
+.section{background:var(--card);border:1px solid #163150;border-radius:10px;padding:10px;margin-bottom:10px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.label{color:var(--muted);font-size:.9em}
+.small{font-size:.85em;color:#b8c7d6}
+.list{font-size:.9em;line-height:1.4em}
+hr{border:none;border-top:1px solid #17314f;margin:10px 0}
+kbd{background:#0e1b2a;border:1px solid #2c3f57;border-bottom-width:2px;padding:1px 5px;border-radius:5px}
+@media(max-width:700px){canvas{height:48vh}}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="row">
+    <input id="username" placeholder="username" style="width:110px">
+    <input id="password" type="password" placeholder="password" style="width:110px">
+    <button class="primary" onclick="signup()">Sign up</button>
+    <button onclick="login()">Login</button>
+    <button onclick="spawn()">Spawn</button>
+    <select id="subSelect" onchange="onSelectSub()" style="min-width:180px"><option value="">Select sub...</option></select>
+    <span class="small" id="hudMini">—</span>
+  </div>
+</header>
+
+<div id="mapWrap">
+  <canvas id="map"></canvas>
+
+  <!-- Map UI: zoom/pan + grid toggles -->
+  <div id="mapUI">
+    <div class="row" style="gap:6px">
+      <label class="small" style="background:#0e1b2a;padding:4px 6px;border-radius:6px;border:1px solid #2c3f57">
+        <input id="showGrid" type="checkbox" checked> Grid
+      </label>
+      <label class="small" style="background:#0e1b2a;padding:4px 6px;border-radius:6px;border:1px solid #2c3f57">
+        <input id="showGridLabels" type="checkbox" checked> Labels
+      </label>
+    </div>
+    <div class="pad">
+      <div></div>
+      <button class="ghost" onclick="panMap(0,-150)">↑</button>
+      <div></div>
+      <button class="ghost" onclick="panMap(-150,0)">←</button>
+      <button class="ghost" onclick="centerOnMe()">◎</button>
+      <button class="ghost" onclick="panMap(150,0)">→</button>
+      <div></div>
+      <button class="ghost" onclick="panMap(0,150)">↓</button>
+      <div></div>
+      <button class="ghost" onclick="resetView()" title="Reset">⟲</button>
+      <button class="ghost" onclick="zoomMap(1.2)">＋</button>
+      <button class="ghost" onclick="zoomMap(1/1.2)">－</button>
+    </div>
+    <label class="small">Zoom: <span id="zoomRead">1.00</span>×</label>
+  </div>
+</div>
+
+<!-- Tabs -->
+<div id="tabbar">
+  <div class="tab active" data-page="maneuver">Maneuvering</div>
+  <div class="tab" data-page="sonar">Sonar</div>
+  <div class="tab" data-page="torps">Torpedoes</div>
+</div>
+
+<!-- Pages -->
+<div id="pages">
+  <!-- Maneuvering Page -->
+  <div class="page active" id="maneuver">
+    <div class="grid2">
+      <div class="section">
+        <div class="label">Propulsion & Depth</div>
+        <div class="row" style="margin-top:6px">
+          <input id="throttle" placeholder="throttle 0..1" style="width:120px">
+          <button onclick="applyThrottle()">Set</button>
+          <button onclick="quickThr(0)">Stop</button>
+          <button onclick="quickThr(0.25)">¼</button>
+          <button onclick="quickThr(0.5)">½</button>
+          <button onclick="quickThr(0.75)">¾</button>
+          <button onclick="quickThr(1.0)">Full</button>
+        </div>
+        <div class="row" style="margin-top:6px">
+          <input id="depthTarget" placeholder="target depth (m)" style="width:140px">
+          <button onclick="setDepth()">Set Depth</button>
+          <button onclick="clearHold()">Clear</button>
+          <button onclick="snorkel(true)">Snorkel</button>
+          <button onclick="snorkel(false)">Dive</button>
+          <button onclick="emergencyBlow()">Blow</button>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="label">Helm</div>
+        <div class="row" style="margin-top:6px">
+          <input id="rudder" placeholder="rudder deg (-30..30)" style="width:170px">
+          <button onclick="setRudder()">Set</button>
+          <!-- Left should send +5 (CCW) -->
+          <button onclick="rudderNudge(+5)">⟲ Left +5</button>
+          <!-- Right should send -5 (CW) -->
+          <button onclick="rudderNudge(-5)">⟳ Right -5</button>
+        </div>
+        <div class="row" style="margin-top:6px">
+          <input id="planes" placeholder="planes -1..1" style="width:150px">
+          <button onclick="setPlanes()">Set</button>
+          <span class="small">Tip: planes ≈ 0 enables depth-hold autopilot</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="label">Status</div>
+      <div id="hud" class="list">—</div>
+    </div>
+  </div>
+
+  <!-- Sonar Page -->
+  <div class="page" id="sonar">
+    <div class="grid2">
+      <div class="section">
+        <div class="label">Active Sonar</div>
+        <div class="row" style="margin-top:6px">
+          <input id="pingBearing" placeholder="az rel (°)" style="width:110px">
+          <input id="pingBeam" placeholder="beam (°)" style="width:100px" value="25">
+          <input id="pingRange" placeholder="range (m)" style="width:120px" value="4000">
+          <button class="primary" onclick="activePing()">Ping</button>
+          <label class="small" style="margin-left:6px"><input id="showEchoes" type="checkbox" checked> show echoes</label>
+        </div>
+        <hr/>
+        <div class="label">Recent Echoes</div>
+        <div id="echoList" class="list">—</div>
+      </div>
+
+      <div class="section">
+        <div class="label">Passive Sonar</div>
+        <div class="row" style="margin-top:6px">
+          <input id="passiveDir" placeholder="array dir (° rel bow)" style="width:170px">
+          <button onclick="setPassiveDir()">Set</button>
+          <label class="small" style="margin-left:6px"><input id="passiveMulti" type="checkbox" checked> multi-bearing</label>
+        </div>
+        <hr/>
+        <div class="label">Recent Bearings</div>
+        <div id="passiveList" class="list">—</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Torpedoes Page -->
+  <div class="page" id="torps">
+    <div class="section">
+      <div class="label">Launch</div>
+      <div class="row" style="margin-top:6px">
+        <input id="wireLen" placeholder="wire length (m)" value="600" style="width:160px">
+        <input id="tubeIdx" placeholder="tube (-2..2)" value="0" style="width:140px">
+        <button class="primary" onclick="launchTorp()">Launch Torpedo</button>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="label">Your Torpedoes</div>
+      <div id="torpList" class="list">—</div>
+    </div>
+
+    <div class="section">
+      <div class="label">Wire Guidance</div>
+      <div class="row" style="margin-top:6px">
+        <input id="torpId" placeholder="torpedo id" style="width:280px">
+      </div>
+      <div class="row" style="margin-top:6px">
+        <input id="torpTurn" placeholder="turn deg (±)" style="width:150px">
+        <button onclick="torpTurn()">Apply Turn</button>
+        <input id="torpHead" placeholder="heading deg (abs)" style="width:170px">
+        <button onclick="torpSetHeading()">Set Heading</button>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <div class="label" style="font-size:12px">Quick Turns:</div>
+        <button onclick="quickTurn(30)" style="width:50px">L30</button>
+        <button onclick="quickTurn(15)" style="width:50px">L15</button>
+        <button onclick="quickTurn(5)" style="width:40px">L5</button>
+        <button onclick="quickTurn(-5)" style="width:40px">R5</button>
+        <button onclick="quickTurn(-15)" style="width:50px">R15</button>
+        <button onclick="quickTurn(-30)" style="width:50px">R30</button>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <input id="torpDepth" placeholder="depth m" style="width:150px">
+        <button onclick="torpSetDepth()">Set Depth</button>
+        <button onclick="detonateTorp()" style="background:#b22222;color:#fff">Detonate</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ---------- State & helpers ---------- */
+const $=id=>document.getElementById(id);
+const API_BASE='';
+let API=null, selected=null;
+let subs=[], torps=[];
+let lastEchoes=[], passiveContacts=[];
+const ECHO_TTL=20, PASSIVE_TTL=12;
+const DPR = window.devicePixelRatio||1;
+
+const auth=()=>({'Authorization':'Bearer '+(API||'')});
+function compassDeg(rad){ let d=(rad*180/Math.PI + 90)%360; if(d<0)d+=360; return d; }
+
+/* ---------- Tabs ---------- */
+[...document.querySelectorAll('#tabbar .tab')].forEach(t=>{
+  t.addEventListener('click', ()=>{
+    document.querySelectorAll('#tabbar .tab').forEach(x=>x.classList.remove('active'));
+    document.querySelectorAll('#pages .page').forEach(x=>x.classList.remove('active'));
+    t.classList.add('active');
+    document.getElementById(t.dataset.page).classList.add('active');
+  });
+});
+
+/* ---------- Signup/Login/Spawn ---------- */
+async function signup(){
+  const u=$('username').value,p=$('password').value;
+  const r=await fetch(API_BASE+'/signup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});
+  const j=await r.json(); if(!j.ok) return alert(j.error);
+  API=j.api_key; connectStream(); alert('Signed up');
+}
+async function login(){
+  const u=$('username').value,p=$('password').value;
+  const r=await fetch(API_BASE+'/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});
+  const j=await r.json(); if(!j.ok) return alert(j.error);
+  API=j.api_key; connectStream(); alert('Logged in');
+}
+async function spawn(){
+  const r=await fetch(API_BASE+'/register_sub',{method:'POST',headers:{...auth()}});
+  const j=await r.json(); if(!j.ok) return alert(j.error);
+  selected=j.sub_id; updateSubSelect(); $('subSelect').value=selected; alert('Spawned '+selected.slice(0,8));
+}
+
+/* ---------- Sub select ---------- */
+function updateSubSelect(){
+  const sel=$('subSelect'), keep=sel.value;
+  sel.innerHTML='<option value="">Select sub...</option>';
+  subs.forEach(s=>{
+    const o=document.createElement('option');
+    o.value=s.id; o.textContent=`${s.id.slice(0,6)} — d:${s.depth.toFixed(0)}m`;
+    if(s.id===keep) o.selected=true;
+    sel.appendChild(o);
+  });
+  if(!selected && subs.length){ selected=subs[0].id; sel.value=selected; }
+}
+function onSelectSub(){ selected=$('subSelect').value||null; }
+
+/* ---------- Maneuvering actions ---------- */
+async function applyThrottle(){ const t=parseFloat($('throttle').value||'0'); await fetch(`/control/${selected}`,{method:'POST',headers:{...auth(),'Content-Type':'application/json'},body:JSON.stringify({throttle:t})});}
+function quickThr(v){$('throttle').value=v; applyThrottle();}
+async function setRudder(){ const v=parseFloat($('rudder').value||'0'); await fetch(`/control/${selected}`,{method:'POST',headers:{...auth(),'Content-Type':'application/json'},body:JSON.stringify({rudder_deg:v})});}
+async function rudderNudge(d){ await fetch(`/control/${selected}`,{method:'POST',headers:{...auth(),'Content-Type':'application/json'},body:JSON.stringify({rudder_nudge_deg:d})});}
+async function setPlanes(){ const v=parseFloat($('planes').value||'0'); await fetch(`/control/${selected}`,{method:'POST',headers:{...auth(),'Content-Type':'application/json'},body:JSON.stringify({planes:v})});}
+async function setDepth(){ const d=parseFloat($('depthTarget').value||''); await fetch(`/control/${selected}`,{method:'POST',headers:{...auth(),'Content-Type':'application/json'},body:JSON.stringify({target_depth:d})});}
+async function clearHold(){ await fetch(`/control/${selected}`,{method:'POST',headers:{...auth(),'Content-Type':'application/json'},body:JSON.stringify({target_depth:null})});}
+async function snorkel(on){ await fetch(`/snorkel/${selected}`,{method:'POST',headers:{...auth(),'Content-Type':'application/json'},body:JSON.stringify({on})});}
+async function emergencyBlow(){ await fetch(`/emergency_blow/${selected}`,{method:'POST',headers:{...auth(),'Content-Type':'application/json'}});}
+
+/* ---------- Sonar actions ---------- */
+async function activePing(){
+  const brg=parseFloat($('pingBearing').value||'0');
+  const beam=parseFloat($('pingBeam').value||'25');
+  const rng=parseFloat($('pingRange').value||'4000');
+  await fetch(`/ping/${selected}`,{method:'POST',headers:{...auth(),'Content-Type':'application/json'},
+    body:JSON.stringify({center_bearing_deg:brg,beamwidth_deg:beam,max_range:rng})});
+}
+async function setPassiveDir(){
+  const v=parseFloat($('passiveDir').value||'0');
+  await fetch(`/set_passive_array/${selected}`,{method:'POST',headers:{...auth(),'Content-Type':'application/json'},body:JSON.stringify({dir_deg:v})});
+}
+
+/* ---------- Torpedoes ---------- */
+async function launchTorp(){
+  const w=parseFloat($('wireLen').value||'600');
+  const tube=parseInt($('tubeIdx').value||'0',10);
+  const r=await fetch(`/launch_torpedo/${selected}`,{method:'POST',headers:{...auth(),'Content-Type':'application/json'},body:JSON.stringify({wire_length:w,tube})});
+  const j=await r.json(); if(!j.ok) return alert(j.error); $('torpId').value=j.torpedo_id;
+}
+async function torpTurn(){
+  const id=$('torpId').value.trim(), turn=parseFloat($('torpTurn').value||'0');
+  await fetch(`/set_torp_heading/${id}`,{method:'POST',headers:{...auth(),'Content-Type':'application/json'},body:JSON.stringify({turn_deg:turn,dt:1.0})});
+}
+async function torpSetHeading(){
+  const id=$('torpId').value.trim(), hdg=parseFloat($('torpHead').value||'0');
+  await fetch(`/set_torp_heading/${id}`,{method:'POST',headers:{...auth(),'Content-Type':'application/json'},body:JSON.stringify({heading_deg:hdg,dt:1.0})});
+}
+async function quickTurn(degrees){
+  const id=$('torpId').value.trim();
+  if(!id){ alert('Enter torpedo ID first'); return; }
+  $('torpTurn').value = degrees;
+  await fetch(`/set_torp_heading/${id}`,{method:'POST',headers:{...auth(),'Content-Type':'application/json'},body:JSON.stringify({turn_deg:degrees,dt:1.0})});
+}
+async function torpSetDepth(){
+  const id=$('torpId').value.trim(), d=parseFloat($('torpDepth').value||'0');
+  await fetch(`/set_torp_depth/${id}`,{method:'POST',headers:{...auth(),'Content-Type':'application/json'},body:JSON.stringify({depth:d})});
+}
+async function detonateTorp(){
+  const id = $('torpId').value.trim();
+  if(!id){ alert('enter torpedo id'); return; }
+  if(!confirm('Detonate torpedo '+id.slice(0,8)+'?')) return;
+  const r = await fetch('/detonate/' + id, { method:'POST', headers:{...auth(),'Content-Type':'application/json'} });
+  const j = await r.json(); if(!j.ok) return alert(j.error||'detonate failed'); alert('Detonated — affected: '+(j.affected||0));
+}
+
+/* ---------- Stream ---------- */
+function connectStream(){
+  const es=new EventSource('/stream?api_key='+API);
+  es.addEventListener('snapshot', e=>{
+    const d=JSON.parse(e.data); subs=d.subs||[]; torps=d.torpedoes||[];
+    updateSubSelect(); renderMiniHUD(); renderEchoList(); renderPassiveList(); renderTorpList();
+  });
+  es.addEventListener('echo', e=>{
+    const d=JSON.parse(e.data); d.time=performance.now()/1000;
+    lastEchoes.unshift(d); if(lastEchoes.length>80) lastEchoes.pop();
+    renderEchoList();
+  });
+  es.addEventListener('contact', e=>{
+    const c=JSON.parse(e.data);
+    if(c.type!=='passive') return;
+    c.time=performance.now()/1000;
+    passiveContacts.unshift(c); if(passiveContacts.length>120) passiveContacts.pop();
+    renderPassiveList();
+  });
+}
+
+/* ---------- HUD text ---------- */
+function renderMiniHUD(){
+  const s=subs.find(z=>z.id===selected);
+  $('hudMini').textContent = s ? `id ${s.id.slice(0,6)} | x ${s.x.toFixed(0)} y ${s.y.toFixed(0)} | d ${s.depth.toFixed(0)}m | spd ${s.speed.toFixed(1)} | bat ${s.battery.toFixed(0)}%` : '—';
+}
+function renderEchoList(){
+  const now=performance.now()/1000;
+  const rows=lastEchoes
+    .filter(e=>e.observer_sub_id===selected && (now-e.time)<=ECHO_TTL)
+    .slice(0,10)
+    .map(e=>{
+      const brg=(e.bearing*180/Math.PI).toFixed(0);
+      const rng=Math.round(e.range);
+      const dep=Math.round(e.estimated_depth);
+      const q=Math.round((e.quality||0)*100);
+      return `• brg ${brg}°  r ${rng}m  depth ~${dep}m  q ${q}%`;
+    });
+  $('echoList').innerHTML = rows.join('<br>') || '—';
+}
+function renderPassiveList(){
+  const now=performance.now()/1000;
+  const list = ($('passiveMulti')?.checked ?? true)
+    ? passiveContacts.filter(c=>c.observer_sub_id===selected && (now-c.time)<=PASSIVE_TTL).slice(0,12)
+    : passiveContacts.filter(c=>c.observer_sub_id===selected && (now-c.time)<=PASSIVE_TTL).slice(0,1);
+  const rows=list.map(c=>{
+    const brg=(c.bearing*180/Math.PI).toFixed(0);
+    return `• brg ${brg}°  ${c.range_class}`;
+  });
+  $('passiveList').innerHTML = rows.join('<br>') || '—';
+}
+
+function renderTorpList(){
+  const rows = (torps||[]).map(t=>{
+    const hdg = (t.heading*180/Math.PI).toFixed(0);
+    const cur = (t.depth ?? 0).toFixed(0);                   // CURRENT depth
+    const tgt = (t.target_depth != null) ? `→${t.target_depth.toFixed(0)}` : '';
+    const wl  = Math.round(t.wire_length ?? 0);
+    const mode= t.mode || t.control_mode || 'wire';
+    const x   = (t.x??0).toFixed(0), y=(t.y??0).toFixed(0);
+    return `• ${t.id.slice(0,6)}  x ${x} y ${y}  d ${cur}m${tgt}  hdg ${hdg}°  ${mode}  wire ${wl}m`;
+  });
+  $('torpList').innerHTML = rows.join('<br>') || '—';
+}
+
+
+
+
+/* ---------- Map / Canvas (WORLD ROTATED so 0°=North) ---------- */
+const canvas=$('map'), ctx=canvas.getContext('2d');
+let viewport={x:0,y:0,zoom:0.15};
+const DPRatio = window.devicePixelRatio||1;
+
+function resize(){canvas.width=canvas.clientWidth*DPRatio;canvas.height=canvas.clientHeight*DPRatio;ctx.setTransform(DPRatio,0,0,DPRatio,0,0);}
+window.addEventListener('resize', resize, {passive:true}); resize();
+
+/* Rotate world by +90° in projection */
+function worldToScreen(x, y){
+  const cx = canvas.clientWidth/2, cy = canvas.clientHeight/2;
+  const dx = x - viewport.x;
+  const dy = y - viewport.y;
+  const xr = -dy;           // R(π/2)[dx,dy] = [-dy, dx]
+  const yr =  dx;
+  return [ cx + xr*viewport.zoom, cy - yr*viewport.zoom ];
+}
+function screenToWorld(sx, sy){
+  const cx = canvas.clientWidth/2, cy = canvas.clientHeight/2;
+  const xr = (sx - cx)/viewport.zoom;
+  const yr = (cy - sy)/viewport.zoom;
+  const dx =  yr;           // R(-π/2)[xr,yr] = [yr, -xr]
+  const dy = -xr;
+  return [ dx + viewport.x, dy + viewport.y ];
+}
+
+function resetView(){
+  viewport.x=0; viewport.y=0;
+  viewport.zoom = Math.min(canvas.clientWidth,canvas.clientHeight)/(6000*2)*1.2;
+}
+function centerOnMe(){ const s=subs.find(z=>z.id===selected); if(!s) return; viewport.x=s.x; viewport.y=s.y; }
+function zoomMap(f){
+  const cx=canvas.clientWidth/2, cy=canvas.clientHeight/2;
+  const [wx,wy]=screenToWorld(cx,cy);
+  viewport.zoom*=f;
+  const [wx2,wy2]=screenToWorld(cx,cy);
+  viewport.x+=wx-wx2; viewport.y+=wy-wy2;
+}
+function panMap(dx,dy){ viewport.x -= dy/viewport.zoom; viewport.y -= dx/viewport.zoom; }
+
+/* Grid helpers */
+function niceStep(pxPerUnit, targetPx){
+  const raw = targetPx / pxPerUnit;
+  const pow10 = Math.pow(10, Math.floor(Math.log10(raw)));
+  const norm = raw / pow10;
+  let step;
+  if (norm < 1.5) step = 1;
+  else if (norm < 3.5) step = 2;
+  else if (norm < 7.5) step = 5;
+  else step = 10;
+  return step * pow10;
+}
+function drawGrid(){
+  if(!$('showGrid').checked) return;
+  const [wx0, wy0] = screenToWorld(0, canvas.clientHeight);
+  const [wx1, wy1] = screenToWorld(canvas.clientWidth, 0);
+  const minX = Math.min(wx0, wx1), maxX = Math.max(wx0, wx1);
+  const minY = Math.min(wy0, wy1), maxY = Math.max(wy0, wy1);
+
+  const unitsPerPx = 1/viewport.zoom;
+  const majorStep = niceStep(1/unitsPerPx, 160);
+  const minorStep = majorStep/4;
+
+  // Minor grid
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = 'rgba(80,120,160,0.25)';
+  let startMinorX = Math.floor(minX/minorStep)*minorStep;
+  let endMinorX   = Math.ceil (maxX/minorStep)*minorStep;
+  for(let x=startMinorX; x<=endMinorX; x+=minorStep){
+    const [sx0, sy0] = worldToScreen(x, minY);
+    const [sx1, sy1] = worldToScreen(x, maxY);
+    ctx.beginPath(); ctx.moveTo(sx0, sy0); ctx.lineTo(sx1, sy1); ctx.stroke();
+  }
+  let startMinorY = Math.floor(minY/minorStep)*minorStep;
+  let endMinorY   = Math.ceil (maxY/minorStep)*minorStep;
+  for(let y=startMinorY; y<=endMinorY; y+=minorStep){
+    const [sx0, sy0] = worldToScreen(minX, y);
+    const [sx1, sy1] = worldToScreen(maxX, y);
+    ctx.beginPath(); ctx.moveTo(sx0, sy0); ctx.lineTo(sx1, sy1); ctx.stroke();
+  }
+
+  // Major grid
+  ctx.lineWidth = 1.5;
+  ctx.strokeStyle = 'rgba(120,170,210,0.45)';
+  let startMajorX = Math.floor(minX/majorStep)*majorStep;
+  let endMajorX   = Math.ceil (maxX/majorStep)*majorStep;
+  for(let x=startMajorX; x<=endMajorX; x+=majorStep){
+    const [sx0, sy0] = worldToScreen(x, minY);
+    const [sx1, sy1] = worldToScreen(x, maxY);
+    ctx.beginPath(); ctx.moveTo(sx0, sy0); ctx.lineTo(sx1, sy1); ctx.stroke();
+  }
+  let startMajorY = Math.floor(minY/majorStep)*majorStep;
+  let endMajorY   = Math.ceil (maxY/majorStep)*majorStep;
+  for(let y=startMajorY; y<=endMajorY; y+=majorStep){
+    const [sx0, sy0] = worldToScreen(minX, y);
+    const [sx1, sy1] = worldToScreen(maxX, y);
+    ctx.beginPath(); ctx.moveTo(sx0, sy0); ctx.lineTo(sx1, sy1); ctx.stroke();
+  }
+
+  // Labels
+  if($('showGridLabels').checked){
+    ctx.fillStyle = '#9fc3e6';
+    ctx.font = '12px ui-monospace';
+    for(let x=startMajorX; x<=endMajorX; x+=majorStep){
+      const [sx, sy] = worldToScreen(x, maxY);
+      ctx.fillText(`X ${Math.round(x)}`, sx+4, sy+14);
+    }
+    for(let y=startMajorY; y<=endMajorY; y+=majorStep){
+      const [sx, sy] = worldToScreen(minX, y);
+      ctx.fillText(`Y ${Math.round(y)}`, sx+6, sy-6);
+    }
+  }
+}
+
+/* draw fan in WORLD coords */
+function drawFanWorld(cx,cy,center_world,beam_deg,range_m,color,alpha){
+  const half=(beam_deg*Math.PI/180)/2;
+  const pts=[];
+  for(let i=-half;i<=half;i+=Math.max(half/9,0.02)){
+    const a=center_world+i;
+    const wx=cx+Math.cos(a)*range_m;
+    const wy=cy+Math.sin(a)*range_m;
+    pts.push(worldToScreen(wx,wy));
+  }
+  const [sx,sy]=worldToScreen(cx,cy);
+  ctx.save();ctx.globalAlpha=alpha;ctx.fillStyle=color;
+  ctx.beginPath();ctx.moveTo(sx,sy);
+  pts.forEach(([px,py])=>ctx.lineTo(px,py));
+  ctx.closePath();ctx.fill();ctx.restore();
+}
+
+/* mouse drag / wheel pan-zoom */
+let pan=false, last=[0,0];
+canvas.addEventListener('pointerdown',e=>{pan=true; last=[e.clientX,e.clientY]; canvas.setPointerCapture(e.pointerId);});
+canvas.addEventListener('pointermove',e=>{ if(!pan) return; const dx=e.clientX-last[0], dy=e.clientY-last[1]; panMap(-dx,-dy); last=[e.clientX,e.clientY];});
+canvas.addEventListener('pointerup',()=>{pan=false;});
+canvas.addEventListener('wheel',e=>{
+  e.preventDefault();
+  const factor=Math.exp(-e.deltaY*0.001);
+  const [wx,wy]=screenToWorld(e.offsetX,e.offsetY);
+  viewport.zoom*=factor;
+  const [wx2,wy2]=screenToWorld(e.offsetX,e.offsetY);
+  viewport.x+=wx-wx2; viewport.y+=wy-wy2;
+},{passive:false});
+
+function draw(){
+  ctx.clearRect(0,0,canvas.clientWidth,canvas.clientHeight);
+  $('zoomRead').textContent = viewport.zoom.toFixed(2);
+
+  drawGrid(); // grid first
+
+  // arena ring (world radius 6000)
+  ctx.strokeStyle='#1a314b'; ctx.lineWidth=2;
+  const [rx,ry]=worldToScreen(0,0); ctx.beginPath(); ctx.arc(rx,ry,6000*viewport.zoom,0,Math.PI*2); ctx.stroke();
+
+  // subs (bow points true direction, world rotated projection)
+  subs.forEach(s=>{
+    const [sx,sy]=worldToScreen(s.x,s.y);
+    ctx.save(); ctx.translate(sx,sy);
+    ctx.rotate(-s.heading + Math.PI/2 + Math.PI);  // flipped triangle, 0°=North
+    ctx.fillStyle=(s.id===selected)?'#5fd9ff':'#6c7f94';
+    ctx.beginPath(); ctx.moveTo(12,0); ctx.lineTo(-10,6); ctx.lineTo(-10,-6); ctx.closePath(); ctx.fill();
+    ctx.restore();
+
+    // label with depth and coordinates
+    ctx.fillStyle='#a8bfd6'; ctx.font='12px ui-monospace';
+    ctx.fillText(`${s.id.slice(0,4)} d:${s.depth.toFixed(0)} x:${s.x.toFixed(0)} y:${s.y.toFixed(0)}`, sx+10, sy-10);
+  });
+
+
+// torpedoes + labels (show current and target if available)
+torps.forEach(t=>{
+  const [tx,ty] = worldToScreen(t.x, t.y);
+
+  // pick CURRENT depth (prefer current_depth, else depth)
+  const cur = (t.current_depth != null ? t.current_depth : t.depth) ?? 0;
+  const tgt = (t.target_depth != null ? t.target_depth : null);
+
+  ctx.fillStyle = '#ffbb33';
+  ctx.beginPath(); ctx.arc(tx,ty,4,0,Math.PI*2); ctx.fill();
+
+  ctx.fillStyle = '#ffd28a';
+  ctx.font = '12px ui-monospace';
+  let label = `d:${cur.toFixed(0)}m`;
+  if (tgt != null && Math.abs(tgt - cur) > 0.5) {
+    label += `→${tgt.toFixed(0)}`;   // show target if different
+  }
+  label += ` x:${(t.x??0).toFixed(0)} y:${(t.y??0).toFixed(0)}`;
+  ctx.fillText(label, tx+6, ty-6);
+});
+
+
+
+  // active echoes & beam
+  const now=performance.now()/1000;
+  if(selected && $('showEchoes').checked){
+    const me=subs.find(z=>z.id===selected);
+    if(me){
+      const beam=parseFloat($('pingBeam').value||'25');
+      const brg=parseFloat($('pingBearing').value||'0');
+      const maxR=parseFloat($('pingRange').value||'4000');
+      const centerWorld = me.heading + (brg*Math.PI/180);
+      drawFanWorld(me.x, me.y, centerWorld, beam, maxR, '#4dd9ff', 0.12);
+
+      lastEchoes.forEach(e=>{
+        if(e.observer_sub_id!==selected) return;
+        const age=now-e.time; if(age>ECHO_TTL) return;
+        const alpha=Math.max(0.15,1-age/ECHO_TTL)*(e.quality??1);
+        const wx=me.x + Math.cos(e.bearing)*e.range;
+        const wy=me.y + Math.sin(e.bearing)*e.range;
+        const [ex,ey]=worldToScreen(wx,wy);
+        ctx.save(); ctx.globalAlpha=alpha; ctx.fillStyle='#4dd9ff';
+        ctx.beginPath(); ctx.arc(ex,ey,5,0,Math.PI*2); ctx.fill();
+        ctx.fillStyle='#cfe3f5'; ctx.font='12px ui-monospace';
+        ctx.fillText(`${Math.round(e.range)}m ~${Math.round(e.estimated_depth)}m`, ex+8, ey-8);
+        ctx.restore();
+      });
+    }
+  }
+
+  // passive bearings
+  if(selected){
+    const me=subs.find(z=>z.id===selected);
+    if(me){
+      const multi = $('passiveMulti')?.checked ?? true;
+      const recent = passiveContacts.filter(p=>p.observer_sub_id===selected && (now-p.time)<=PASSIVE_TTL);
+      const list = multi ? recent : recent.slice(0,1);
+      const [sx,sy]=worldToScreen(me.x,me.y);
+      list.forEach(p=>{
+        const len = (p.range_class==='short'?1200:p.range_class==='medium'?2400:4000);
+        const wx = me.x + Math.cos(p.bearing)*len;
+        const wy = me.y + Math.sin(p.bearing)*len;
+        const [ex,ey]=worldToScreen(wx,wy);
+        const age=now-p.time, alpha=Math.max(0.2,1-age/PASSIVE_TTL);
+        ctx.save(); ctx.globalAlpha=alpha; ctx.strokeStyle='#ffaa33'; ctx.lineWidth=2;
+        ctx.beginPath(); ctx.moveTo(sx,sy); ctx.lineTo(ex,ey); ctx.stroke(); ctx.restore();
+      });
+    }
+  }
+
+  requestAnimationFrame(draw);
+}
+resetView(); requestAnimationFrame(draw);
+
+/* ---------- Periodic HUD ---------- */
+setInterval(()=>{
+  const s=subs.find(z=>z.id===selected);
+  if(!s){ $('hud').innerHTML='—'; $('hudMini').textContent='—'; return; }
+  $('hud').innerHTML =
+    `id <kbd>${s.id.slice(0,8)}</kbd><br>`+
+    `pos X ${s.x.toFixed(1)} m  Y ${s.y.toFixed(1)} m<br>`+
+    `depth ${s.depth.toFixed(1)} m | target ${s.target_depth==null?'—':s.target_depth.toFixed(0)} m<br>`+
+    `heading ${compassDeg(s.heading).toFixed(0)}° | pitch ${(s.pitch*180/Math.PI).toFixed(1)}° | rudder ${(s.rudder_angle*180/Math.PI).toFixed(1)}°<br>`+
+    `speed ${s.speed.toFixed(2)} m/s | throttle ${(s.throttle*100).toFixed(0)}%<br>`+
+    `battery ${s.battery.toFixed(1)}% | snorkel ${s.is_snorkeling?'ON':'off'} | blow ${Math.round(s.blow_charge*100)}%<br>`+
+    `health ${s.health.toFixed(0)}%`;
+  renderMiniHUD();
+}, 1000);
+</script>
+</body>
+</html>
+
