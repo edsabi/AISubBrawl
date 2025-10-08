@@ -1,5 +1,6 @@
 
 
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -147,11 +148,12 @@ kbd{background:#0e1b2a;border:1px solid #2c3f57;border-bottom-width:2px;padding:
         <div class="label">Active Sonar</div>
         <div class="row" style="margin-top:6px">
           <input id="pingBearing" placeholder="az rel (°)" style="width:110px">
-          <input id="pingBeam" placeholder="beam (°)" style="width:100px" value="25">
-          <input id="pingRange" placeholder="range (m)" style="width:120px" value="4000">
+          <input id="pingBeam" placeholder="beam (°)" style="width:100px" value="25" max="210">
+          <input id="pingRange" placeholder="range (m)" style="width:120px" value="4000" max="6000">
           <button class="primary" onclick="activePing()">Ping</button>
           <label class="small" style="margin-left:6px"><input id="showEchoes" type="checkbox" checked> show echoes</label>
         </div>
+        <div class="small" style="margin-top:4px">Battery cost: <span id="pingBatteryCost">1.1</span>% | Max beam: 210° | Max range: 6000m</div>
         <hr/>
         <div class="label">Recent Echoes</div>
         <div id="echoList" class="list">—</div>
@@ -167,6 +169,12 @@ kbd{background:#0e1b2a;border:1px solid #2c3f57;border-bottom-width:2px;padding:
         <hr/>
         <div class="label">Recent Bearings</div>
         <div id="passiveList" class="list">—</div>
+        <div class="small" style="margin-top:4px; color:#888;">
+          🚢 submarine • 🚀 torpedo • 📡 ping<br>
+          <span style="color:#ffaa33">■</span> sub 
+          <span style="color:#ff4444">■</span> torp 
+          <span style="color:#44ff44">■</span> ping
+        </div>
       </div>
     </div>
   </div>
@@ -176,10 +184,11 @@ kbd{background:#0e1b2a;border:1px solid #2c3f57;border-bottom-width:2px;padding:
     <div class="section">
       <div class="label">Launch</div>
       <div class="row" style="margin-top:6px">
-        <input id="wireLen" placeholder="wire length (m)" value="600" style="width:160px">
+        <input id="torpRange" placeholder="range (m)" value="600" max="6000" style="width:160px">
         <input id="tubeIdx" placeholder="tube (-2..2)" value="0" style="width:140px">
         <button class="primary" onclick="launchTorp()">Launch Torpedo</button>
       </div>
+      <div class="small" style="margin-top:4px">Battery cost: <span id="batteryCost">8.0</span>%</div>
     </div>
 
     <div class="section">
@@ -188,9 +197,19 @@ kbd{background:#0e1b2a;border:1px solid #2c3f57;border-bottom-width:2px;padding:
     </div>
 
     <div class="section">
-      <div class="label">Wire Guidance</div>
+      <div class="label">Torpedo Control</div>
       <div class="row" style="margin-top:6px">
-        <input id="torpId" placeholder="torpedo id" style="width:280px">
+        <select id="torpSelect" onchange="onSelectTorp()" style="min-width:280px">
+          <option value="">Select torpedo...</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="label">Movement Commands</div>
+      <div class="row" style="margin-top:6px">
+        <input id="torpSpeed" placeholder="speed (8-18)" style="width:120px">
+        <button onclick="torpSetSpeed()">Set Speed</button>
       </div>
       <div class="row" style="margin-top:6px">
         <input id="torpTurn" placeholder="turn deg (±)" style="width:150px">
@@ -213,6 +232,32 @@ kbd{background:#0e1b2a;border:1px solid #2c3f57;border-bottom-width:2px;padding:
         <button onclick="detonateTorp()" style="background:#b22222;color:#fff">Detonate</button>
       </div>
     </div>
+
+    <div class="section">
+      <div class="label">Torpedo Sonar</div>
+      <div class="row" style="margin-top:6px">
+        <div class="label" style="font-size:12px">Active Ping:</div>
+        <input id="torpPingRange" placeholder="range m" value="800" style="width:120px">
+        <button onclick="torpPing()">Ping</button>
+        <button id="torpPingToggle" onclick="torpPingToggle()">Auto: OFF</button>
+      </div>
+      <div class="small" style="margin-top:4px">
+        Torpedo sonar: 2000m passive range, 1500m active range (30° beam)<br>
+        Lower speeds = harder to detect by enemy sonar
+      </div>
+      <hr/>
+      <div class="label">Torpedo Sonar Contacts</div>
+      <div id="torpSonarList" class="list">—</div>
+      <div class="small" style="margin-top:4px; color:#888;">
+        🎯 torpedo detected submarine
+      </div>
+      <hr/>
+      <div class="label">Torpedo Ping Results</div>
+      <div id="torpPingList" class="list">—</div>
+      <div class="small" style="margin-top:4px; color:#888;">
+        📡 active ping contacts (range/bearing/depth)
+      </div>
+    </div>
   </div>
 </div>
 
@@ -220,14 +265,37 @@ kbd{background:#0e1b2a;border:1px solid #2c3f57;border-bottom-width:2px;padding:
 /* ---------- State & helpers ---------- */
 const $=id=>document.getElementById(id);
 const API_BASE='';
-let API=null, selected=null;
+let API=null, selected=null, selectedTorp=null;
 let subs=[], torps=[];
-let lastEchoes=[], passiveContacts=[];
+let lastEchoes=[], passiveContacts=[], torpPingContacts=[];
 const ECHO_TTL=20, PASSIVE_TTL=12;
 const DPR = window.devicePixelRatio||1;
 
 const auth=()=>({'Authorization':'Bearer '+(API||'')});
 function compassDeg(rad){ let d=(rad*180/Math.PI + 90)%360; if(d<0)d+=360; return d; }
+
+function updateTorpSelect(){
+  const sel = $('torpSelect');
+  sel.innerHTML = '<option value="">Select torpedo...</option>';
+  torps.forEach(t => {
+    const opt = document.createElement('option');
+    opt.value = t.id;
+    opt.textContent = `${t.id.slice(0,6)} - Speed: ${t.speed?.toFixed(1) || 'N/A'} m/s - Depth: ${t.depth?.toFixed(0) || 'N/A'}m`;
+    sel.appendChild(opt);
+  });
+}
+
+function onSelectTorp(){
+  selectedTorp = $('torpSelect').value || null;
+  renderTorpSonarList();
+  renderTorpPingList();
+  
+  // Update ping toggle button state
+  const torp = torps.find(t => t.id === selectedTorp);
+  if(torp) {
+    updateTorpPingToggleButton(torp.active_sonar_enabled || false);
+  }
+}
 
 /* ---------- Tabs ---------- */
 [...document.querySelectorAll('#tabbar .tab')].forEach(t=>{
@@ -298,35 +366,88 @@ async function setPassiveDir(){
 
 /* ---------- Torpedoes ---------- */
 async function launchTorp(){
-  const w=parseFloat($('wireLen').value||'600');
+  const range=Math.min(parseFloat($('torpRange').value||'600'), 6000);
   const tube=parseInt($('tubeIdx').value||'0',10);
-  const r=await fetch(`/launch_torpedo/${selected}`,{method:'POST',headers:{...auth(),'Content-Type':'application/json'},body:JSON.stringify({wire_length:w,tube})});
-  const j=await r.json(); if(!j.ok) return alert(j.error); $('torpId').value=j.torpedo_id;
+  const r=await fetch(`/launch_torpedo/${selected}`,{method:'POST',headers:{...auth(),'Content-Type':'application/json'},body:JSON.stringify({range:range,tube})});
+  const j=await r.json(); if(!j.ok) return alert(j.error); 
+  selectedTorp = j.torpedo_id;
+  updateTorpSelect();
+  $('torpSelect').value = selectedTorp;
 }
+
+async function torpSetSpeed(){
+  if(!selectedTorp){ alert('Select a torpedo first'); return; }
+  const speed=parseFloat($('torpSpeed').value||'18');
+  await fetch(`/set_torp_speed/${selectedTorp}`,{method:'POST',headers:{...auth(),'Content-Type':'application/json'},body:JSON.stringify({speed})});
+}
+
 async function torpTurn(){
-  const id=$('torpId').value.trim(), turn=parseFloat($('torpTurn').value||'0');
-  await fetch(`/set_torp_heading/${id}`,{method:'POST',headers:{...auth(),'Content-Type':'application/json'},body:JSON.stringify({turn_deg:turn,dt:1.0})});
+  if(!selectedTorp){ alert('Select a torpedo first'); return; }
+  const turn=parseFloat($('torpTurn').value||'0');
+  await fetch(`/set_torp_heading/${selectedTorp}`,{method:'POST',headers:{...auth(),'Content-Type':'application/json'},body:JSON.stringify({turn_deg:turn,dt:1.0})});
 }
+
 async function torpSetHeading(){
-  const id=$('torpId').value.trim(), hdg=parseFloat($('torpHead').value||'0');
-  await fetch(`/set_torp_heading/${id}`,{method:'POST',headers:{...auth(),'Content-Type':'application/json'},body:JSON.stringify({heading_deg:hdg,dt:1.0})});
+  if(!selectedTorp){ alert('Select a torpedo first'); return; }
+  const hdg=parseFloat($('torpHead').value||'0');
+  await fetch(`/set_torp_heading/${selectedTorp}`,{method:'POST',headers:{...auth(),'Content-Type':'application/json'},body:JSON.stringify({heading_deg:hdg,dt:1.0})});
 }
+
 async function quickTurn(degrees){
-  const id=$('torpId').value.trim();
-  if(!id){ alert('Enter torpedo ID first'); return; }
+  if(!selectedTorp){ alert('Select a torpedo first'); return; }
   $('torpTurn').value = degrees;
-  await fetch(`/set_torp_heading/${id}`,{method:'POST',headers:{...auth(),'Content-Type':'application/json'},body:JSON.stringify({turn_deg:degrees,dt:1.0})});
+  await fetch(`/set_torp_heading/${selectedTorp}`,{method:'POST',headers:{...auth(),'Content-Type':'application/json'},body:JSON.stringify({turn_deg:degrees,dt:1.0})});
 }
+
 async function torpSetDepth(){
-  const id=$('torpId').value.trim(), d=parseFloat($('torpDepth').value||'0');
-  await fetch(`/set_torp_depth/${id}`,{method:'POST',headers:{...auth(),'Content-Type':'application/json'},body:JSON.stringify({depth:d})});
+  if(!selectedTorp){ alert('Select a torpedo first'); return; }
+  const d=parseFloat($('torpDepth').value||'0');
+  await fetch(`/set_torp_depth/${selectedTorp}`,{method:'POST',headers:{...auth(),'Content-Type':'application/json'},body:JSON.stringify({depth:d})});
 }
+
+async function torpPing(){
+  if(!selectedTorp){ alert('Select a torpedo first'); return; }
+  const range=parseFloat($('torpPingRange').value||'800');
+  const r=await fetch(`/torp_ping/${selectedTorp}`,{method:'POST',headers:{...auth(),'Content-Type':'application/json'},body:JSON.stringify({max_range:range})});
+  const j=await r.json(); if(!j.ok) return alert(j.error||'ping failed');
+  
+  const now=performance.now()/1000;
+  j.contacts.forEach(contact => {
+    torpPingContacts.unshift({
+      torpedo_id: selectedTorp,
+      bearing: contact.bearing,
+      range: contact.range,
+      depth: contact.depth,
+      time: now
+    });
+  });
+  if(torpPingContacts.length>120) torpPingContacts.splice(120);
+  renderTorpPingList();
+}
+
+async function torpPingToggle(){
+  if(!selectedTorp){ alert('Select a torpedo first'); return; }
+  const r=await fetch(`/torp_ping_toggle/${selectedTorp}`,{method:'POST',headers:{...auth(),'Content-Type':'application/json'}});
+  const j=await r.json(); if(!j.ok) return alert(j.error||'toggle failed');
+  updateTorpPingToggleButton(j.active_sonar_enabled);
+}
+
+function updateTorpPingToggleButton(enabled){
+  const btn = $('torpPingToggle');
+  if(btn) {
+    btn.textContent = enabled ? 'Auto: ON' : 'Auto: OFF';
+    btn.style.backgroundColor = enabled ? '#228B22' : '';
+  }
+}
+
 async function detonateTorp(){
-  const id = $('torpId').value.trim();
-  if(!id){ alert('enter torpedo id'); return; }
-  if(!confirm('Detonate torpedo '+id.slice(0,8)+'?')) return;
-  const r = await fetch('/detonate/' + id, { method:'POST', headers:{...auth(),'Content-Type':'application/json'} });
-  const j = await r.json(); if(!j.ok) return alert(j.error||'detonate failed'); alert('Detonated — affected: '+(j.affected||0));
+  if(!selectedTorp){ alert('Select a torpedo first'); return; }
+  if(!confirm('Detonate torpedo '+selectedTorp.slice(0,8)+'?')) return;
+  const r = await fetch('/detonate/' + selectedTorp, { method:'POST', headers:{...auth(),'Content-Type':'application/json'} });
+  const j = await r.json(); if(!j.ok) return alert(j.error||'detonate failed'); 
+  alert('Detonated — affected: '+(j.affected||0));
+  selectedTorp = null;
+  updateTorpSelect();
 }
 
 /* ---------- Stream ---------- */
@@ -334,7 +455,7 @@ function connectStream(){
   const es=new EventSource('/stream?api_key='+API);
   es.addEventListener('snapshot', e=>{
     const d=JSON.parse(e.data); subs=d.subs||[]; torps=d.torpedoes||[];
-    updateSubSelect(); renderMiniHUD(); renderEchoList(); renderPassiveList(); renderTorpList();
+    updateSubSelect(); updateTorpSelect(); renderMiniHUD(); renderEchoList(); renderPassiveList(); renderTorpList(); renderTorpSonarList(); renderTorpPingList();
   });
   es.addEventListener('echo', e=>{
     const d=JSON.parse(e.data); d.time=performance.now()/1000;
@@ -343,10 +464,36 @@ function connectStream(){
   });
   es.addEventListener('contact', e=>{
     const c=JSON.parse(e.data);
-    if(c.type!=='passive') return;
+    if(c.type==='passive' || c.type==='active_ping_detected') {
+      c.time=performance.now()/1000;
+      if(c.type==='active_ping_detected') c.contact_type='ping';
+      passiveContacts.unshift(c); if(passiveContacts.length>120) passiveContacts.pop();
+      renderPassiveList();
+    }
+  });
+  es.addEventListener('torpedo_contact', e=>{
+    const c=JSON.parse(e.data);
     c.time=performance.now()/1000;
+    // Add torpedo prefix to distinguish from sub contacts
+    c.contact_type = 'torpedo_' + c.contact_type;
     passiveContacts.unshift(c); if(passiveContacts.length>120) passiveContacts.pop();
     renderPassiveList();
+    renderTorpSonarList();
+  });
+  es.addEventListener('torpedo_ping', e=>{
+    const d=JSON.parse(e.data);
+    const now=performance.now()/1000;
+    d.contacts.forEach(contact => {
+      torpPingContacts.unshift({
+        torpedo_id: d.torpedo_id,
+        bearing: contact.bearing,
+        range: contact.range,
+        depth: contact.depth,
+        time: now
+      });
+    });
+    if(torpPingContacts.length>120) torpPingContacts.splice(120);
+    renderTorpPingList();
   });
 }
 
@@ -376,9 +523,44 @@ function renderPassiveList(){
     : passiveContacts.filter(c=>c.observer_sub_id===selected && (now-c.time)<=PASSIVE_TTL).slice(0,1);
   const rows=list.map(c=>{
     const brg=(c.bearing*180/Math.PI).toFixed(0);
-    return `• brg ${brg}°  ${c.range_class}`;
+    const relBrg = c.bearing_relative ? (c.bearing_relative*180/Math.PI).toFixed(0) : '?';
+    const contactIcon = c.contact_type === 'torpedo' ? '🚀' : 
+                       c.contact_type === 'torpedo_submarine' ? '🎯' :
+                       c.contact_type === 'ping' ? '📡' : 
+                       c.contact_type === 'emergency_blow' ? '💨' : '🚢';
+    const direction = Math.abs(parseFloat(relBrg)) < 45 ? 'ahead' :
+                     Math.abs(parseFloat(relBrg)) > 135 ? 'astern' :
+                     parseFloat(relBrg) > 0 ? 'starboard' : 'port';
+    return `${contactIcon} ${direction} ${brg}° ${c.range_class}`;
   });
   $('passiveList').innerHTML = rows.join('<br>') || '—';
+}
+
+function renderTorpSonarList(){
+  const now=performance.now()/1000;
+  const torpContacts = passiveContacts.filter(c=>c.torpedo_id===selectedTorp && c.contact_type.startsWith('torpedo_') && (now-c.time)<=PASSIVE_TTL).slice(0,8);
+  const rows=torpContacts.map(c=>{
+    const brg=(c.bearing*180/Math.PI).toFixed(0);
+    const relBrg = c.bearing_relative ? (c.bearing_relative*180/Math.PI).toFixed(0) : '?';
+    const contactIcon = '🎯';
+    const direction = Math.abs(parseFloat(relBrg)) < 45 ? 'ahead' :
+                     Math.abs(parseFloat(relBrg)) > 135 ? 'astern' :
+                     parseFloat(relBrg) > 0 ? 'starboard' : 'port';
+    return `${contactIcon} ${direction} ${brg}° ${c.range_class}`;
+  });
+  $('torpSonarList').innerHTML = rows.join('<br>') || '—';
+}
+
+function renderTorpPingList(){
+  const now=performance.now()/1000;
+  const pingContacts = torpPingContacts.filter(c=>c.torpedo_id===selectedTorp && (now-c.time)<=PASSIVE_TTL).slice(0,8);
+  const rows=pingContacts.map(c=>{
+    const brg=(c.bearing*180/Math.PI).toFixed(0);
+    const rng=Math.round(c.range);
+    const dep=Math.round(c.depth);
+    return `📡 ${brg}° ${rng}m d${dep}m`;
+  });
+  $('torpPingList').innerHTML = rows.join('<br>') || '—';
 }
 
 function renderTorpList(){
@@ -389,7 +571,7 @@ function renderTorpList(){
     const wl  = Math.round(t.wire_length ?? 0);
     const mode= t.mode || t.control_mode || 'wire';
     const x   = (t.x??0).toFixed(0), y=(t.y??0).toFixed(0);
-    return `• ${t.id.slice(0,6)}  x ${x} y ${y}  d ${cur}m${tgt}  hdg ${hdg}°  ${mode}  wire ${wl}m`;
+    return `• ${t.id.slice(0,6)}  x ${x} y ${y}  d ${cur}m${tgt}  hdg ${hdg}°  ${mode}  range ${wl}m`;
   });
   $('torpList').innerHTML = rows.join('<br>') || '—';
 }
@@ -588,6 +770,49 @@ torps.forEach(t=>{
   ctx.fillText(label, tx+6, ty-6);
 });
 
+// torpedo sonar contacts for all owned torpedoes
+if($('showEchoes')?.checked){
+  const now=performance.now()/1000;
+  const myTorps = torps.filter(t => subs.some(s => s.id === selected && s.owner_id)); // torpedoes from my subs
+  
+  myTorps.forEach(torp => {
+    // Active ping contacts (green circles)
+    const pingContacts = torpPingContacts.filter(c=>c.torpedo_id===torp.id && (now-c.time)<=PASSIVE_TTL);
+    pingContacts.forEach(contact => {
+      const contactX = torp.x + Math.cos(contact.bearing) * contact.range;
+      const contactY = torp.y + Math.sin(contact.bearing) * contact.range;
+      const [cx, cy] = worldToScreen(contactX, contactY);
+      
+      ctx.fillStyle = '#00ff00';
+      ctx.beginPath(); ctx.arc(cx, cy, 6, 0, Math.PI*2); ctx.fill();
+      ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(cx, cy, 6, 0, Math.PI*2); ctx.stroke();
+      
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '10px ui-monospace';
+      ctx.fillText(`${Math.round(contact.range)}m`, cx+8, cy-8);
+    });
+    
+    // Passive sonar contacts (orange bearing lines)
+    const passiveContacts = passiveContacts.filter(c=>c.torpedo_id===torp.id && c.contact_type.startsWith('torpedo_') && (now-c.time)<=PASSIVE_TTL);
+    passiveContacts.forEach(contact => {
+      const [tx, ty] = worldToScreen(torp.x, torp.y);
+      const endX = torp.x + Math.cos(contact.bearing) * 2000;
+      const endY = torp.y + Math.sin(contact.bearing) * 2000;
+      const [ex, ey] = worldToScreen(endX, endY);
+      
+      ctx.strokeStyle = '#ffaa00';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([5, 5]);
+      ctx.beginPath();
+      ctx.moveTo(tx, ty);
+      ctx.lineTo(ex, ey);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    });
+  });
+}
+
 
 
   // active echoes & beam
@@ -631,7 +856,14 @@ torps.forEach(t=>{
         const wy = me.y + Math.sin(p.bearing)*len;
         const [ex,ey]=worldToScreen(wx,wy);
         const age=now-p.time, alpha=Math.max(0.2,1-age/PASSIVE_TTL);
-        ctx.save(); ctx.globalAlpha=alpha; ctx.strokeStyle='#ffaa33'; ctx.lineWidth=2;
+        
+        // Different colors for different contact types
+        let color = '#ffaa33'; // default submarine
+        if(p.contact_type === 'torpedo') color = '#ff4444';
+        if(p.contact_type === 'ping') color = '#44ff44';
+        if(p.contact_type === 'emergency_blow') color = '#ff8800';
+        
+        ctx.save(); ctx.globalAlpha=alpha; ctx.strokeStyle=color; ctx.lineWidth=2;
         ctx.beginPath(); ctx.moveTo(sx,sy); ctx.lineTo(ex,ey); ctx.stroke(); ctx.restore();
       });
     }
@@ -654,7 +886,29 @@ setInterval(()=>{
     `battery ${s.battery.toFixed(1)}% | snorkel ${s.is_snorkeling?'ON':'off'} | blow ${Math.round(s.blow_charge*100)}%<br>`+
     `health ${s.health.toFixed(0)}%`;
   renderMiniHUD();
+  
+  // Update torpedo battery cost
+  const range = parseFloat($('torpRange')?.value || '600');
+  const cost = (range / 100) * 1.33;
+  if($('batteryCost')) $('batteryCost').textContent = cost.toFixed(1);
+  
+  // Update ping battery cost
+  const pingBeam = parseFloat($('pingBeam')?.value || '25');
+  const pingRange = parseFloat($('pingRange')?.value || '4000');
+  const pingCost = 0.5 + (pingBeam * 0.04) + ((pingRange / 100) * 0.2683);
+  if($('pingBatteryCost')) $('pingBatteryCost').textContent = pingCost.toFixed(1);
 }, 1000);
+
+// Update ping battery cost when inputs change
+function updatePingBatteryCost() {
+  const pingBeam = parseFloat($('pingBeam')?.value || '25');
+  const pingRange = parseFloat($('pingRange')?.value || '4000');
+  const pingCost = 0.5 + (pingBeam * 0.04) + ((pingRange / 100) * 0.2683);
+  if($('pingBatteryCost')) $('pingBatteryCost').textContent = pingCost.toFixed(1);
+}
+
+$('pingBeam')?.addEventListener('input', updatePingBatteryCost);
+$('pingRange')?.addEventListener('input', updatePingBatteryCost);
 </script>
 </body>
 </html>
