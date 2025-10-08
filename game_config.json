@@ -9,25 +9,28 @@
   },
 
   "sub": {
-    "max_speed": 6.0,
+    "max_speed": 12.0,
+    "acceleration": 2.0,
     "yaw_rate_deg_s": 20.0,
     "pitch_rate_deg_s": 12.0,
     "planes_effect": 1.0,
     "neutral_bias": 0.008,
     "depth_damping": 0.35,
     "snorkel_depth": 15.0,
+    "snorkel_off_hysteresis": 2.0,
 
     "emergency_blow": {
-      "duration_s": 10.0,
-      "upward_mps": 5.0,
-      "recharge_per_s_at_snorkel": 0.06,
+      "duration_s": 60.0,
+      "upward_mps": 12.0,
+      "recharge_per_s_at_snorkel": 0.02,
       "cooldown_s": 0.0
     },
 
     "battery": {
-      "initial_min": 55.0,
-      "initial_max": 90.0,
-      "drain_per_throttle_per_s": 0.02,
+      "initial_min": 40.0,
+      "initial_max": 80.0,
+      "drain_per_throttle_per_s": 0.1,
+      "high_speed_multiplier": 15.0,
       "recharge_per_s_snorkel": 0.25
     },
 
@@ -36,27 +39,56 @@
   },
 
   "torpedo": {
-    "speed": 36.0,
+    "speed": 18.0,
+    "min_speed": 8.0,
+    "max_speed": 18.0,
     "turn_rate_deg_s": 30.0,
     "depth_rate_m_s": 6.0,
-    "blast_radius": 200,
+    "blast_radius": 120.0,
     "lifetime_s": 240.0,
-    "default_wire": 600.0
+    "max_range": 6000.0,
+    "battery_cost_per_100m": 1.33,
+    "proximity_fuze_m": 30.0,
+    "arming_delay_s": 10.0,
+    "sonar": {
+      "passive": {
+        "base_snr": 6.0,
+        "speed_noise_gain": 0.8,
+        "max_range": 2000.0,
+        "bearing_jitter_deg": 5.0,
+        "report_interval_s": [1.0, 2.0]
+      },
+      "active": {
+        "max_range": 1500.0,
+        "max_angle": 60.0,
+        "sound_speed": 1500.0,
+        "rng_sigma_m": 20.0,
+        "brg_sigma_deg": 2.0,
+        "battery_cost": 0.5
+      }
+    }
   },
 
   "sonar": {
     "passive": {
       "base_snr": 8.0,
       "speed_noise_gain": 0.6,
-      "snorkel_bonus": 8.0,
+      "snorkel_bonus": 15.0,
       "bearing_jitter_deg": 3.0,
       "report_interval_s": [2.0, 4.0]
     },
     "active": {
       "max_range": 6000.0,
+      "max_angle": 210.0,
       "sound_speed": 1500.0,
       "rng_sigma_m": 40.0,
       "brg_sigma_deg": 1.5
+    },
+    "active_power": {
+      "base_cost": 0.5,
+      "cost_per_degree": 0.04,
+      "cost_per_100m_range": 0.2683,
+      "min_battery": 5.0
     }
   }
 }
