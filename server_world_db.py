@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 import os, json, math, random, time, threading, queue, uuid, copy
-from typing import Dict
+from typing import Dict, List, Tuple
 from flask import Flask, request, jsonify, Response, send_from_directory, stream_with_context
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import text
+from sqlalchemy.orm.exc import StaleDataError
 from werkzeug.security import generate_password_hash, check_password_hash
 
 # -------------------------- Defaults --------------------------
@@ -23,6 +24,7 @@ DEFAULT_CFG = {
         "neutral_bias": 0.008,
         "depth_damping": 0.35,
         "snorkel_depth": 15.0,
+        "snorkel_off_hysteresis": 2.0,  # <-- new: prevents flapping at the limit
         "emergency_blow": {
             "duration_s": 10.0,
             "upward_mps": 5.0,
@@ -44,7 +46,10 @@ DEFAULT_CFG = {
         "depth_rate_m_s": 6.0,
         "blast_radius": 60.0,
         "lifetime_s": 240.0,
-        "default_wire": 600.0
+        "default_wire": 600.0,
+        "max_range": 5000.0,
+        "proximity_fuze_m": 0.0,
+        "arming_delay_s": 1.0
     },
     "sonar": {
         "passive": {
@@ -59,6 +64,11 @@ DEFAULT_CFG = {
             "sound_speed": 1500.0,
             "rng_sigma_m": 40.0,
             "brg_sigma_deg": 1.5
+        },
+        "active_power": {
+            "cost_per_ping": 1.0,
+            "cost_per_degree": 0.01,
+            "min_battery": 5.0
         }
     }
 }
@@ -87,14 +97,12 @@ TICK = 1.0 / TICK_HZ
 
 # -------------------------- App / DB --------------------------
 app = Flask(__name__)
-# important: allow cross-thread use + timeout
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get(
     'DATABASE_URL',
     'sqlite:///sub_brawl.sqlite3?check_same_thread=false'
 )
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'change-me')
-
 app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
     "pool_pre_ping": True,
     "pool_recycle": 1800,
@@ -102,7 +110,6 @@ app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
 }
 
 db = SQLAlchemy(app)
-
 WORLD_LOCK = threading.RLock()
 
 # -------------------------- Models --------------------------
@@ -119,14 +126,14 @@ class ApiKey(db.Model):
 
 class SubModel(db.Model):
     id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    owner_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    owner_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
     x = db.Column(db.Float, default=0.0)
     y = db.Column(db.Float, default=0.0)
     depth = db.Column(db.Float, default=100.0)
     heading = db.Column(db.Float, default=0.0)       # radians, 0=east CCW+
     pitch = db.Column(db.Float, default=0.0)         # + = bow up
-    rudder_angle = db.Column(db.Float, default=0.0)  # radians
-    rudder_cmd = db.Column(db.Float, default=0.0)    # radians target
+    rudder_angle = db.Column(db.Float, default=0.0)  # radians (servo)
+    rudder_cmd = db.Column(db.Float, default=0.0)    # -1..+1
     planes = db.Column(db.Float, default=0.0)        # -1..1 manual
     throttle = db.Column(db.Float, default=0.2)      # 0..1
     target_depth = db.Column(db.Float, default=None)
@@ -143,7 +150,7 @@ class SubModel(db.Model):
 
 class TorpedoModel(db.Model):
     id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    owner_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    owner_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
     parent_sub = db.Column(db.String(36), db.ForeignKey('sub_model.id'), nullable=False)
     x = db.Column(db.Float, default=0.0)
     y = db.Column(db.Float, default=0.0)
@@ -158,15 +165,15 @@ class TorpedoModel(db.Model):
 
 with app.app_context():
     db.create_all()
-    # SQLite concurrency tuning: WAL + sane sync + long busy timeout
     try:
         with db.engine.connect() as con:
             con.execute(text("PRAGMA journal_mode=WAL;"))
             con.execute(text("PRAGMA synchronous=NORMAL;"))
             con.execute(text("PRAGMA busy_timeout=60000;"))
-        print("[DB] SQLite WAL enabled, busy_timeout=60000ms, synchronous=NORMAL")
+            con.execute(text("PRAGMA temp_store=MEMORY;"))
     except Exception as e:
         print("[DB] PRAGMA set failed:", e)
+    print("[DB] SQLite WAL enabled, busy_timeout=60000ms, synchronous=NORMAL")
 
 # -------------------------- Helpers --------------------------
 def clamp(v, lo, hi): return max(lo, min(hi, v))
@@ -175,6 +182,9 @@ def wrap_angle(a):
     while a < -math.pi: a += 2*math.pi
     return a
 def distance(x1,y1,x2,y2): return math.hypot(x2-x1, y2-y1)
+def distance3d(ax, ay, az, bx, by, bz):
+    dx = ax - bx; dy = ay - by; dz = az - bz
+    return math.sqrt(dx*dx + dy*dy + dz*dz)
 
 # -------------------------- Auth --------------------------
 def make_key():
@@ -203,9 +213,6 @@ def require_key(fn):
     w.__name__ = fn.__name__
     return w
 
-
-
-
 # -------------------------- SSE per-user --------------------------
 USER_QUEUES: Dict[int, "queue.Queue[str]"] = {}
 USER_LAST: Dict[int, float] = {}
@@ -224,29 +231,42 @@ def send_private(user_id: int, event: str, obj: dict):
     except queue.Full:
         pass
 
+def _sub_pub(s: SubModel):
+    return dict(
+        id=s.id, x=s.x, y=s.y, depth=s.depth, heading=s.heading, pitch=s.pitch,
+        rudder_angle=s.rudder_angle, rudder_cmd=s.rudder_cmd, planes=s.planes,
+        speed=s.speed, battery=s.battery, is_snorkeling=s.is_snorkeling,
+        blow_active=s.blow_active, blow_charge=s.blow_charge, health=s.health,
+        target_depth=s.target_depth, throttle=s.throttle
+    )
+
+def _torp_pub(t: TorpedoModel):
+    return dict(id=t.id, x=t.x, y=t.y, depth=t.depth, heading=t.heading,
+                speed=t.speed, mode=t.control_mode, wire_length=t.wire_length)
+
 def send_snapshot(user_id: int):
-    # lock DB read to avoid racing with writer
     with WORLD_LOCK:
         subs = SubModel.query.filter_by(owner_id=user_id).all()
         torps = TorpedoModel.query.filter_by(owner_id=user_id).all()
-    def sub_pub(s: SubModel):
-        return dict(
-            id=s.id, x=s.x, y=s.y, depth=s.depth, heading=s.heading, pitch=s.pitch,
-            rudder_angle=s.rudder_angle, rudder_cmd=s.rudder_cmd, planes=s.planes,
-            speed=s.speed, battery=s.battery, is_snorkeling=s.is_snorkeling,
-            blow_active=s.blow_active, blow_charge=s.blow_charge, health=s.health,
-            target_depth=s.target_depth, throttle=s.throttle
-        )
-    def torp_pub(t: TorpedoModel):
-        return dict(id=t.id, x=t.x, y=t.y, depth=t.depth, heading=t.heading,
-                    speed=t.speed, mode=t.control_mode, wire_length=t.wire_length)
     q = _uq(user_id)
-    obj = {"subs":[sub_pub(s) for s in subs], "torpedoes":[torp_pub(t) for t in torps], "time": time.time()}
+    obj = {
+        "subs":[_sub_pub(s) for s in subs],
+        "torpedoes":[_torp_pub(t) for t in torps],
+        "time": time.time()
+    }
     payload = f"event: snapshot\ndata: {json.dumps(obj)}\n\n"
     try: q.put_nowait(payload)
     except queue.Full: pass
 
-
+def send_snapshot_mem(user_id: int, subs: List[SubModel], torps: List[TorpedoModel]):
+    q = _uq(user_id)
+    obj = {
+        "subs":[_sub_pub(s) for s in subs if s.owner_id == user_id],
+        "torpedoes":[_torp_pub(t) for t in torps if t.owner_id == user_id],
+        "time": time.time()
+    }
+    try: q.put_nowait(f"event: snapshot\ndata: {json.dumps(obj)}\n\n")
+    except queue.Full: pass
 
 # -------------------------- World / spawn --------------------------
 WORLD_RING = GAME_CFG.get("world", {}).get("ring", DEFAULT_CFG["world"]["ring"])
@@ -280,58 +300,42 @@ PENDING_PINGS = []  # active sonar echoes waiting to return
 def update_sub(s: SubModel, dt: float, now: float):
     scfg = GAME_CFG.get("sub", DEFAULT_CFG["sub"])
     max_spd      = scfg["max_speed"]
-    yaw_rate_rad = math.radians(scfg["yaw_rate_deg_s"])          # rad/s @ full rudder
+    yaw_rate_rad = math.radians(scfg["yaw_rate_deg_s"])
     pitch_rate   = math.radians(scfg["pitch_rate_deg_s"])
     planes_eff   = scfg["planes_effect"]
     neutral      = scfg["neutral_bias"]
     crush_depth  = scfg["crush_depth"]
     crush_dps    = scfg["crush_dps_per_100m"]
 
-    # === RUDDER: normalized command -> servo angle (radians) ===
-    # Configurable limits
-    max_rudder_deg  = scfg.get("max_rudder_deg", 30.0)           # hardware limit
-    rudder_rate_deg = scfg.get("rudder_rate_deg_s", 60.0)        # servo slew rate
+    # RUDDER servo
+    max_rudder_deg  = scfg.get("max_rudder_deg", 30.0)
+    rudder_rate_deg = scfg.get("rudder_rate_deg_s", 60.0)
     MAX_RUDDER_RAD  = math.radians(max_rudder_deg)
     MAX_RUDDER_STEP = math.radians(rudder_rate_deg) * dt
 
-    # Ensure command is normalized
-    s.rudder_cmd = max(-1.0, min(1.0, float(s.rudder_cmd or 0.0)))
-
-    # Target servo angle (radians) from normalized command
+    s.rudder_cmd = clamp(float(s.rudder_cmd or 0.0), -1.0, 1.0)
     target_rudder_angle = s.rudder_cmd * MAX_RUDDER_RAD
-
-    # Current servo angle defaults to 0 if None
     if s.rudder_angle is None:
         s.rudder_angle = 0.0
-
-    # Slew the servo toward target (no wrap needed; small range)
     error = target_rudder_angle - s.rudder_angle
-    if error > 0:
-        s.rudder_angle += min(error, MAX_RUDDER_STEP)
-    else:
-        s.rudder_angle += max(error, -MAX_RUDDER_STEP)
+    s.rudder_angle += clamp(error, -MAX_RUDDER_STEP, MAX_RUDDER_STEP)
+    s.rudder_angle = clamp(s.rudder_angle, -MAX_RUDDER_RAD, MAX_RUDDER_RAD)
 
-    # Clamp to physical stop
-    s.rudder_angle = max(-MAX_RUDDER_RAD, min(MAX_RUDDER_RAD, s.rudder_angle))
-
-    # === Heading integration (CCW positive) ===
-    # Scale yaw linearly with actual rudder deflection fraction
-    rudder_frac = 0.0 if MAX_RUDDER_RAD == 0 else (s.rudder_angle / MAX_RUDDER_RAD)  # -1..+1
+    # Heading integration
+    rudder_frac = 0.0 if MAX_RUDDER_RAD == 0 else (s.rudder_angle / MAX_RUDDER_RAD)
     s.heading = wrap_angle(s.heading + yaw_rate_rad * rudder_frac * dt)
 
-    # ... keep the rest of your update (speed, planes->pitch, buoyancy, damage, etc.)
-
-    # Manual planes map to pitch target (positive planes -> bow up)
+    # Planes -> pitch
     target_pitch = clamp(s.planes * planes_eff, -1.0, 1.0) * math.radians(20.0)
     s.pitch += clamp(target_pitch - s.pitch, -pitch_rate*dt, pitch_rate*dt)
 
-    # Speed from throttle
+    # Speed
     s.speed = clamp(s.throttle, 0.0, 1.0) * max_spd
 
-    # Vertical dynamics (v_down positive = deeper)
-    v_down = neutral * (1.0 - s.throttle)  # natural sink if slow
+    # Vertical dynamics
+    v_down = neutral * (1.0 - s.throttle)
 
-    # Emergency blow (rise = reduce v_down)
+    # Emergency blow
     ebcfg = scfg["emergency_blow"]
     if s.blow_active and now < s.blow_end and s.blow_charge > 0.0:
         v_down -= ebcfg["upward_mps"]
@@ -339,15 +343,15 @@ def update_sub(s: SubModel, dt: float, now: float):
     else:
         s.blow_active = False
 
-    # Depth-hold autopilot (only when planesÃ¢â€°Ë†0)
+    # Depth hold autopilot
     autopilot_on = (s.target_depth is not None) and (abs(s.planes) < 0.05)
     if autopilot_on:
-        err_m = s.target_depth - s.depth   # + if need deeper (down)
+        err_m = s.target_depth - s.depth
         ap_pitch = clamp(-err_m * math.radians(0.5), -math.radians(25), math.radians(25))
         s.pitch += clamp(ap_pitch - s.pitch, -pitch_rate*dt, pitch_rate*dt)
         v_down += clamp(err_m * 0.02, -1.5, 1.5)
 
-    # Hydrodynamic lift: bow-up reduces depth => subtract from v_down
+    # Hydrodynamic lift
     LIFT = 0.45
     v_down -= math.sin(s.pitch) * max(0.0, s.speed) * LIFT
 
@@ -358,13 +362,17 @@ def update_sub(s: SubModel, dt: float, now: float):
     s.x += math.cos(s.heading) * s.speed * dt
     s.y += math.sin(s.heading) * s.speed * dt
 
-    # Battery
+    # Battery & snorkel recharge + auto-off with hysteresis
     bcfg = scfg["battery"]
-    s.battery = clamp(s.battery - s.throttle * bcfg["drain_per_throttle_per_s"] * dt, 0.0, 100.0)
-    if s.is_snorkeling and s.depth <= scfg["snorkel_depth"]:
+    s.battery = max(0.0, min(100.0, s.battery - s.throttle * bcfg["drain_per_throttle_per_s"] * dt))
+
+    snorkel_depth = scfg.get("snorkel_depth", 15.0)
+    off_hyst = scfg.get("snorkel_off_hysteresis", 2.0)
+    if s.is_snorkeling and s.depth <= snorkel_depth:
         s.battery = clamp(s.battery + bcfg["recharge_per_s_snorkel"] * dt, 0.0, 100.0)
         s.blow_charge = clamp(s.blow_charge + ebcfg["recharge_per_s_at_snorkel"] * dt, 0.0, 1.0)
-    else:
+    # Auto-off once we exceed snorkel depth + hysteresis
+    if s.is_snorkeling and s.depth > (snorkel_depth + off_hyst):
         s.is_snorkeling = False
 
     # Low battery safety
@@ -375,126 +383,106 @@ def update_sub(s: SubModel, dt: float, now: float):
     if s.depth > crush_depth:
         over = s.depth - crush_depth
         dps = (over / 100.0) * crush_dps
-        s.health -= dps * dt
-        if s.health <= 0.0: s.health = 0.0
+        s.health = max(0.0, s.health - dps * dt)
 
-def distance3d(ax, ay, az, bx, by, bz):
-    dx = ax - bx; dy = ay - by; dz = az - bz
-    return math.sqrt(dx*dx + dy*dy + dz*dz)
-
-def explode_torpedo(t: 'TorpedoModel'):
-    """Apply damage & delete the torpedo."""
+def explode_torpedo_in_mem(t: TorpedoModel, subs: List[SubModel], pending_events: List[Tuple[int,str,dict]]):
     blast = GAME_CFG["torpedo"]["blast_radius"]
-    # Kill everything within spherical radius
-    victims = []
-    for s in SubModel.query.all():
+    for s in subs:
         d = distance3d(t.x, t.y, t.depth, s.x, s.y, s.depth)
-        if d <= blast:
+        if d <= blast and s.health > 0.0:
             s.health = 0.0
-            victims.append(s.id)
-            send_private(s.owner_id, 'explosion', {
-                "time": time.time(),
-                "at": [t.x, t.y, t.depth],
-                "torpedo_id": t.id,
-                "blast_radius": blast
-            })
-    db.session.delete(t)
-    return victims
+            pending_events.append((
+                s.owner_id, 'explosion',
+                {"time": time.time(), "at": [t.x, t.y, t.depth], "torpedo_id": t.id, "blast_radius": blast}
+            ))
 
-def update_torpedo(t: 'TorpedoModel', dt: float, now: float):
+def update_torpedo(t: TorpedoModel, dt: float, now: float):
     cfg = GAME_CFG["torpedo"]
-    turn_rate = math.radians(cfg.get("turn_rate_deg_per_s", 10.0))
-    depth_rate = cfg.get("depth_rate_m_per_s", 2.0)
-    max_range = cfg.get("max_range", 5000.0)
-    prox = cfg.get("proximity_fuze_m", 0.0)
-    speed = float(getattr(t, "speed", cfg.get("speed", 20.0)))
+    turn_rate = math.radians(cfg.get("turn_rate_deg_s", DEFAULT_CFG["torpedo"]["turn_rate_deg_s"]))
+    depth_rate = float(cfg.get("depth_rate_m_s", DEFAULT_CFG["torpedo"]["depth_rate_m_s"]))
+    max_range = float(cfg.get("max_range", DEFAULT_CFG["torpedo"]["max_range"]))
+    prox = float(cfg.get("proximity_fuze_m", DEFAULT_CFG["torpedo"]["proximity_fuze_m"]))
+    speed = float(getattr(t, "speed", cfg.get("speed", DEFAULT_CFG["torpedo"]["speed"])))
 
-    # Initialize start point once (for max_range tracking)
     if getattr(t, "start_x", None) is None:
         t.start_x = t.x
         t.start_y = t.y
         if getattr(t, "created_at", None) is None:
             t.created_at = now
 
-    # --- Wire control cutoff by geometry ---
+    # Wire control cutoff by geometry
     if t.control_mode == 'wire' and t.parent_sub:
-        parent = SubModel.query.get(t.parent_sub)
+        parent = SubModel.query.get(t.parent_sub)  # occasional lookup
         if parent is not None:
             dist_parent = distance(t.x, t.y, parent.x, parent.y)
-            if dist_parent > float(t.wire_length or cfg.get("wire_length", 1000.0)):
-                t.control_mode = 'dumb'  # lost the wire
+            if dist_parent > float(t.wire_length or cfg.get("default_wire", 1000.0)):
+                t.control_mode = 'free'
 
-    # --- Heading guidance ---
-    # Expect your wire commands to set either t.target_heading (abs) or t.turn_cmd (delta per request)
+    # Heading guidance
     if getattr(t, "target_heading", None) is not None:
         da = wrap_angle(t.target_heading - t.heading)
         step = clamp(da, -turn_rate*dt, turn_rate*dt)
         t.heading = wrap_angle(t.heading + step)
     elif getattr(t, "pending_turn", None) is not None:
-        # Optional one-shot "turn by X deg" behavior if you store it
         want = math.radians(t.pending_turn)
         step = clamp(want, -turn_rate*dt, turn_rate*dt)
         t.heading = wrap_angle(t.heading + step)
-        t.pending_turn = (math.degrees(want - step)) if abs(want - step) > 1e-4 else None
+        rem = want - step
+        t.pending_turn = (math.degrees(rem)) if abs(rem) > 1e-4 else None
 
-    # --- Depth guidance (toward target_depth) ---
+    # Depth guidance
     if getattr(t, "target_depth", None) is not None:
         dz = t.target_depth - t.depth
         t.depth += clamp(dz, -depth_rate*dt, depth_rate*dt)
 
-    # --- Integrate position ---
+    # Integrate position
     t.x += math.cos(t.heading) * speed * dt
     t.y += math.sin(t.heading) * speed * dt
 
-    # --- Range self-destruct ---
+    # Range self-destruct
     traveled = distance(t.x, t.y, t.start_x, t.start_y)
     if traveled > max_range:
-        db.session.delete(t)
+        t._expired = True
         return
 
-    # --- Arming delay & proximity fuze (optional but nice) ---
-    if prox > 0.0 and (now - t.created_at) >= cfg.get("arming_delay_s", 1.0):
-        for s in SubModel.query.all():
-            if s.health <= 0: 
-                continue
-            if distance3d(t.x, t.y, t.depth, s.x, s.y, s.depth) <= prox:
-                explode_torpedo(t)
-                return
+    # Proximity fuze check flag (blast handled later)
+    t._check_prox = prox > 0.0 and (now - t.created_at) >= cfg.get("arming_delay_s", 1.0)
 
-
-
-
-
-def process_wire_links():
-    for t in TorpedoModel.query.all():
-        parent = SubModel.query.get(t.parent_sub)
+def process_wire_links_mem(torps: List[TorpedoModel], subs: List[SubModel]):
+    for t in torps:
+        if t.control_mode != 'wire':
+            continue
+        parent = next((s for s in subs if s.id == t.parent_sub), None)
         if not parent:
             t.control_mode = 'free'; continue
         d = distance(t.x, t.y, parent.x, parent.y)
-        if d > t.wire_length:
+        if d > float(t.wire_length or GAME_CFG["torpedo"].get("default_wire", 1000.0)):
             t.control_mode = 'free'
 
-def process_explosions():
+def process_explosions_mem(torps: List[TorpedoModel], subs: List[SubModel], pending_events: List[Tuple[int,str,dict]]):
     blast = GAME_CFG.get("torpedo", DEFAULT_CFG["torpedo"])["blast_radius"]
-    for t in TorpedoModel.query.all():
-        for s in SubModel.query.all():
-            if s.owner_id == t.owner_id and s.id == t.parent_sub:
-                continue
-            if distance(t.x, t.y, s.x, s.y) <= blast and abs(t.depth - s.depth) < blast:
-                send_private(s.owner_id, 'explosion', {"time": time.time(), "at": [t.x, t.y]})
-                s.health = 0.0
-                db.session.delete(t)
-                break
+    for t in torps:
+        if getattr(t, "_expired", False):
+            t._delete = True
+            continue
+        if getattr(t, "_check_prox", False):
+            for s in subs:
+                if s.health <= 0: 
+                    continue
+                if distance3d(t.x, t.y, t.depth, s.x, s.y, s.depth) <= blast:
+                    explode_torpedo_in_mem(t, subs, pending_events)
+                    t._delete = True
+                    break
 
-def schedule_passive_contacts(now: float):
+def schedule_passive_contacts(now: float, subs: List[SubModel], pending_events: List[Tuple[int,str,dict]]):
     pcfg = GAME_CFG.get("sonar", {}).get("passive", DEFAULT_CFG["sonar"]["passive"])
     acfg = GAME_CFG.get("sonar", {}).get("active", DEFAULT_CFG["sonar"]["active"])
     subcfg = GAME_CFG.get("sub", DEFAULT_CFG["sub"])
-    for obs in SubModel.query.all():
+    for obs in subs:
         if now - obs.last_report < random.uniform(*pcfg["report_interval_s"]):
             continue
-        for tgt in SubModel.query.all():
-            if tgt.id == obs.id and tgt.owner_id == obs.owner_id:
+        for tgt in subs:
+            if tgt.owner_id == obs.owner_id and tgt.id == obs.id:
                 continue
             speed_noise = pcfg["speed_noise_gain"] * (tgt.speed / subcfg["max_speed"])
             snorkel_bonus = pcfg["snorkel_bonus"] if tgt.is_snorkeling else 0.0
@@ -506,11 +494,11 @@ def schedule_passive_contacts(now: float):
             if snr < 5.0:
                 continue
             brg = math.atan2(tgt.y - obs.y, tgt.x - obs.x)
-            rel = wrap_angle(brg - obs.heading)
             jitter = math.radians(pcfg["bearing_jitter_deg"] if tgt.depth < 50.0 else 1.0)
-            brg += random.uniform(-jitter, jitter); brg = wrap_angle(brg); rel = wrap_angle(brg - obs.heading)
+            brg = wrap_angle(brg + random.uniform(-jitter, jitter))
+            rel = wrap_angle(brg - obs.heading)
             rc = "short" if rng < 1200 else "medium" if rng < 3000 else "long"
-            send_private(obs.owner_id, 'contact', {
+            pending_events.append((obs.owner_id,'contact',{
                 "type": "passive",
                 "observer_sub_id": obs.id,
                 "bearing": brg,
@@ -518,7 +506,7 @@ def schedule_passive_contacts(now: float):
                 "range_class": rc,
                 "snr": snr,
                 "time": now
-            })
+            }))
             obs.last_report = now
             break
 
@@ -528,7 +516,7 @@ def schedule_active_ping(obs: SubModel, beam_deg: float, max_range: float, now: 
     if center_world is None:
         center_world = obs.heading
 
-    for tgt in SubModel.query.all():
+    for tgt in SubModel.query.all():  # rare read
         if tgt.id == obs.id and tgt.owner_id == obs.owner_id:
             continue
         dx = tgt.x - obs.x; dy = tgt.y - obs.y
@@ -565,13 +553,6 @@ def process_active_pings(now: float):
         range_noise   = max(5.0, acfg["rng_sigma_m"] * (1.0 - q))
         est_brg = wrap_angle(float(p['bearing']) + random.uniform(-bearing_noise, bearing_noise))
         est_rng = max(1.0, float(p['rng']) + random.uniform(-range_noise, range_noise))
-        obs_depth = float(p.get('observer_depth', 0.0))
-        tgt_depth = float(p.get('target_depth', obs_depth))
-        dz = tgt_depth - obs_depth
-        horiz = max(1e-3, math.sqrt(max(0.0, float(p['rng'])**2 - dz**2)))
-        vertical_angle = math.atan2(dz, horiz)
-        sigma = max(3.0, 30.0 * (1.0 - q))
-        est_depth = tgt_depth + random.gauss(0.0, sigma)
         obs = SubModel.query.get(p['observer_sub_id'])
         obs_heading = float(obs.heading) if obs else 0.0
         send_private(p['observer_user_id'], 'echo', {
@@ -581,38 +562,118 @@ def process_active_pings(now: float):
             'bearing_relative': wrap_angle(est_brg - obs_heading),
             'range': est_rng,
             'quality': q,
-            'vertical_angle': vertical_angle,
-            'estimated_depth': est_depth,
             'time': now
         })
 
+# -------------------------- PERF --------------------------
+_perf = {"tick_ms": 0.0, "db_fetch_ms": 0.0, "physics_ms": 0.0, "db_commit_ms": 0.0}
+def _ms(t0): return (time.time() - t0) * 1000.0
+
+# -------------------------- Main loop --------------------------
+def _apply_fields(dst, src, fields):
+    for f in fields:
+        setattr(dst, f, getattr(src, f))
+
 def game_loop():
     with app.app_context():
-        last = time.time()
+        last_ts = time.time()
         while True:
-            start = time.time()
-            dt = start - last
-            last = start
-            with WORLD_LOCK:
-                for s in SubModel.query.all():
+            loop_start = time.time()
+            dt = max(0.0, min(loop_start - last_ts, 0.25))  # clamp dt
+            last_ts = loop_start
+            try:
+                # 1) Snapshot
+                t0 = time.time()
+                with WORLD_LOCK:
+                    subs: List[SubModel] = SubModel.query.all()
+                    torps: List[TorpedoModel] = TorpedoModel.query.all()
+                _perf["db_fetch_ms"] = _ms(t0)
+
+                # 2) Physics outside lock
+                t1 = time.time()
+                pending_events: List[Tuple[int,str,dict]] = []
+                dead_sub_ids = set()
+
+                for s in subs:
                     if s.health <= 0.0:
-                        db.session.delete(s)
-                        continue
-                    update_sub(s, dt, start)
-                db.session.commit()
-                for t in TorpedoModel.query.all():
-                    update_torpedo(t, dt, start)
-                process_wire_links()
-                process_explosions()
-                db.session.commit()
-                schedule_passive_contacts(start)
-                process_active_pings(start)
-                # periodic snapshots to each user (throttled)
+                        dead_sub_ids.add(s.id); continue
+                    update_sub(s, dt, loop_start)
+
+                for t in torps:
+                    update_torpedo(t, dt, loop_start)
+
+                process_wire_links_mem(torps, subs)
+                process_explosions_mem(torps, subs, pending_events)
+                schedule_passive_contacts(loop_start, subs, pending_events)
+                process_active_pings(loop_start)
+                _perf["physics_ms"] = _ms(t1)
+
+                # 3) Commit once, resilient to concurrent deletes
+                t2 = time.time()
+                with WORLD_LOCK:
+                    try:
+                        # delete dead subs
+                        for sid in list(dead_sub_ids):
+                            srow = db.session.get(SubModel, sid)
+                            if srow: db.session.delete(srow)
+
+                        # delete marked/expired torps
+                        for t in torps:
+                            if getattr(t, "_delete", False) or getattr(t, "_expired", False):
+                                trow = db.session.get(TorpedoModel, t.id)
+                                if trow: db.session.delete(trow)
+
+                        # update subs that still exist
+                        sub_fields = ["x","y","depth","heading","pitch","rudder_angle","rudder_cmd",
+                                      "planes","throttle","target_depth","speed","battery","is_snorkeling",
+                                      "blow_active","blow_charge","blow_end","health","passive_dir","last_report"]
+                        for s in subs:
+                            if s.id in dead_sub_ids: 
+                                continue
+                            srow = db.session.get(SubModel, s.id)
+                            if srow:
+                                _apply_fields(srow, s, sub_fields)
+
+                        # update torps that still exist
+                        torp_fields = ["x","y","depth","target_depth","heading","speed",
+                                       "control_mode","wire_length","updated_at","created_at"]
+                        for t in torps:
+                            if getattr(t, "_delete", False) or getattr(t, "_expired", False):
+                                continue
+                            trow = db.session.get(TorpedoModel, t.id)
+                            if trow:
+                                _apply_fields(trow, t, torp_fields)
+
+                        db.session.commit()
+
+                    except StaleDataError as se:
+                        print("[GAME_LOOP] StaleDataError during commit:", se, flush=True)
+                        db.session.rollback()
+                    except Exception as e:
+                        print("[GAME_LOOP] Commit error:", repr(e), flush=True)
+                        db.session.rollback()
+                _perf["db_commit_ms"] = _ms(t2)
+
+                # 4) Fan-out (no lock)
+                for uid, ev, obj in pending_events:
+                    send_private(uid, ev, obj)
+                now = time.time()
                 for uid in list(USER_QUEUES.keys()):
-                    if time.time() - USER_LAST.get(uid, 0) > 1.0:
-                        send_snapshot(uid); USER_LAST[uid] = time.time()
-            spent = time.time() - start
-            time.sleep(max(0.0, TICK - spent))
+                    if now - USER_LAST.get(uid, 0) > 1.0:
+                        send_snapshot_mem(uid, subs, torps)
+                        USER_LAST[uid] = now
+
+            except Exception as e:
+                print("[GAME_LOOP] ERROR:", repr(e), flush=True)
+                try:
+                    db.session.rollback()
+                except Exception:
+                    pass
+
+            _perf["tick_ms"] = _ms(loop_start)
+            sleep_left = TICK - (time.time() - loop_start)
+            if sleep_left > 0:
+                time.sleep(sleep_left)
 
 # -------------------------- Routes --------------------------
 @app.get('/')
@@ -657,21 +718,11 @@ def state():
     with WORLD_LOCK:
         subs = SubModel.query.filter_by(owner_id=request.user.id).all()
         torps = TorpedoModel.query.filter_by(owner_id=request.user.id).all()
-    def sub_pub(s: SubModel):
-        return dict(
-            id=s.id, x=s.x, y=s.y, depth=s.depth, heading=s.heading, pitch=s.pitch,
-            rudder_angle=s.rudder_angle, rudder_cmd=s.rudder_cmd, planes=s.planes,
-            speed=s.speed, battery=s.battery, is_snorkeling=s.is_snorkeling,
-            blow_active=s.blow_active, blow_charge=s.blow_charge, health=s.health,
-            target_depth=s.target_depth, throttle=s.throttle
-        )
-    def torp_pub(t: TorpedoModel):
-        return dict(id=t.id, x=t.x, y=t.y, depth=t.depth, heading=t.heading,
-                    speed=t.speed, mode=t.control_mode, wire_length=t.wire_length)
     return jsonify({
         "ok": True,
-        "subs": [sub_pub(s) for s in subs],
-        "torpedoes": [torp_pub(t) for t in torps]
+        "time": time.time(),
+        "subs": [_sub_pub(s) for s in subs],
+        "torpedoes": [_torp_pub(t) for t in torps]
     })
 
 @app.post('/register_sub')
@@ -703,72 +754,74 @@ def register_sub():
         db.session.add(s); db.session.commit()
         return jsonify({"ok": True, "sub_id": s.id, "spawn": [s.x, s.y, s.depth]})
 
-
 @app.post('/control/<sub_id>')
 @require_key
 def control(sub_id):
     d = request.get_json(force=True) or {}
     MAX_RUDDER_DEG = GAME_CFG.get("sub", {}).get("max_rudder_deg", 30.0)
 
-    def clamp(v, lo, hi):  # if you already have clamp imported, remove this local one
-        return lo if v < lo else hi if v > hi else v
-
     with WORLD_LOCK:
         s = SubModel.query.get(sub_id)
         if not s or s.owner_id != request.user.id:
             return jsonify({"ok": False, "error": "not found"}), 404
 
-        # target depth: number or null to clear
         if "target_depth" in d:
             td = d["target_depth"]
             s.target_depth = None if td is None else float(td)
 
-        # throttle: 0..1
         if "throttle" in d:
             s.throttle = clamp(float(d["throttle"]), 0.0, 1.0)
 
-        # planes: -1..1 (positive = planes up if that's your convention)
         if "planes" in d:
             s.planes = clamp(float(d["planes"]), -1.0, 1.0)
 
-        # RUDDER:
-        # Convention: positive degrees = LEFT/port = CCW = heading increases.
-        # Store both a readable angle and a normalized command for physics.
-        # If you don't have these fields yet, add them to the model: rudder_angle_deg (Float), rudder_cmd (Float).
         if "rudder_deg" in d:
             rdeg = clamp(float(d["rudder_deg"]), -MAX_RUDDER_DEG, MAX_RUDDER_DEG)
-            s.rudder_angle_deg = rdeg
-            s.rudder_cmd = rdeg / MAX_RUDDER_DEG  # -1..+1
+            s.rudder_cmd = rdeg / MAX_RUDDER_DEG
 
         if "rudder_nudge_deg" in d:
             nudge = float(d["rudder_nudge_deg"])
-            # Start from current angle if present; else derive from cmd
-            curr_deg = getattr(s, "rudder_angle_deg", (s.rudder_cmd if hasattr(s, "rudder_cmd") else 0.0) * MAX_RUDDER_DEG)
+            curr_deg = (s.rudder_cmd or 0.0) * MAX_RUDDER_DEG
             new_deg = clamp(curr_deg + nudge, -MAX_RUDDER_DEG, MAX_RUDDER_DEG)
-            s.rudder_angle_deg = new_deg
             s.rudder_cmd = new_deg / MAX_RUDDER_DEG
 
         db.session.commit()
         return jsonify({"ok": True})
 
-
-
-
+# --- UPDATED: snorkel route with toggle + depth enforcement ---
 @app.post('/snorkel/<sub_id>')
 @require_key
 def snorkel(sub_id):
-    d = request.get_json(force=True)
-    on = bool(d.get('on', True))
+    d = (request.get_json(silent=True) or {})
     scfg = GAME_CFG.get("sub", DEFAULT_CFG["sub"])
+    snorkel_depth = scfg.get("snorkel_depth", 15.0)
+
     with WORLD_LOCK:
         s = SubModel.query.get(sub_id)
         if not s or s.owner_id != request.user.id:
             return jsonify({"ok": False, "error": "not found"}), 404
-        if on and s.depth > scfg["snorkel_depth"]:
-            return jsonify({"ok": False, "error": "too deep to snorkel"}), 400
-        s.is_snorkeling = on
+
+        # Toggle if no explicit "on" passed, or toggle:true provided
+        do_toggle = bool(d.get("toggle", False)) or ("on" not in d)
+
+        if do_toggle:
+            if not s.is_snorkeling:
+                if s.depth > snorkel_depth:
+                    return jsonify({"ok": False, "error": "too deep to snorkel"}), 400
+                s.is_snorkeling = True
+            else:
+                s.is_snorkeling = False
+        else:
+            want_on = bool(d.get("on", True))
+            if want_on:
+                if s.depth > snorkel_depth:
+                    return jsonify({"ok": False, "error": "too deep to snorkel"}), 400
+                s.is_snorkeling = True
+            else:
+                s.is_snorkeling = False
+
         db.session.commit()
-        return jsonify({"ok": True, "is_snorkeling": s.is_snorkeling})
+        return jsonify({"ok": True, "is_snorkeling": s.is_snorkeling, "depth": s.depth, "limit": snorkel_depth})
 
 @app.post('/emergency_blow/<sub_id>')
 @require_key
@@ -784,55 +837,44 @@ def emergency_blow(sub_id):
         db.session.commit()
         return jsonify({"ok": True})
 
-
-
 @app.post('/launch_torpedo/<sub_id>')
 @require_key
 def launch_torpedo(sub_id):
     d = request.get_json(force=True)
     wire = float(d.get('wire_length', GAME_CFG.get("torpedo", DEFAULT_CFG["torpedo"])["default_wire"]))
-    tube = int(d.get('tube', 0))  # 0=center, negative=port, positive=starboard
+    tube = int(d.get('tube', 0))
 
-    # how far ahead of the subÃ¢â‚¬â„¢s center to spawn (nose distance)
-    NOSE_OFFSET = 12.0  # meters forward
-    # lateral spacing between tubes (per index step)
-    TUBE_SPACING = 2.0  # meters left/right
+    NOSE_OFFSET = 12.0
+    TUBE_SPACING = 2.0
 
     with WORLD_LOCK:
         s = SubModel.query.get(sub_id)
         if not s or s.owner_id != request.user.id:
             return jsonify({"ok": False, "error": "sub not found"}), 404
 
-        # compute spawn point in world coords from subÃ¢â‚¬â„¢s local frame
-        # forward unit = (cosH, sinH), right unit = (-sinH, cosH)
         cosH, sinH = math.cos(s.heading), math.sin(s.heading)
-        fwd_x, fwd_y = cosH, sinH
         right_x, right_y = -sinH, cosH
 
-        lateral = tube * TUBE_SPACING  # +starboard, -port
-        spawn_x = s.x + fwd_x * NOSE_OFFSET + right_x * lateral
-        spawn_y = s.y + fwd_y * NOSE_OFFSET + right_y * lateral
+        lateral = tube * TUBE_SPACING
+        spawn_x = s.x + cosH * NOSE_OFFSET + right_x * lateral
+        spawn_y = s.y + sinH * NOSE_OFFSET + right_y * lateral
         spawn_depth = s.depth
 
         t = TorpedoModel(
             owner_id=request.user.id,
             parent_sub=s.id,
             x=spawn_x, y=spawn_y, depth=spawn_depth,
-            heading=s.heading,  # straight out the bow
+            heading=s.heading,
             speed=GAME_CFG.get("torpedo", DEFAULT_CFG["torpedo"])["speed"],
             control_mode='wire',
             wire_length=wire
         )
-
-        # (optional) arm delay to avoid instant self-kill within 1s
         t.created_at = time.time()
         db.session.add(t)
         db.session.commit()
 
         return jsonify({"ok": True, "torpedo_id": t.id, "wire_length": t.wire_length, "tube": tube,
                         "spawn": {"x": spawn_x, "y": spawn_y, "depth": spawn_depth}})
-
-
 
 @app.post('/set_torp_depth/<torp_id>')
 @require_key
@@ -845,14 +887,9 @@ def set_torp_depth(torp_id):
             return jsonify({"ok": False, "error": "torpedo not found"}), 404
         if t.owner_id != request.user.id:
             return jsonify({"ok": False, "error": "not your torpedo"}), 403
-
-        # set TARGET only
         t.target_depth = new_depth
         db.session.commit()
         return jsonify({"ok": True, "depth": t.depth, "target_depth": t.target_depth})
-
-
-
 
 @app.post('/set_torp_heading/<torp_id>')
 @require_key
@@ -892,7 +929,6 @@ def set_passive_array(sub_id):
         db.session.commit()
         return jsonify({"ok": True})
 
-
 @app.post('/ping/<sub_id>')
 @require_key
 def ping(sub_id):
@@ -913,20 +949,18 @@ def ping(sub_id):
         if s.battery < cost:
             return jsonify({"ok": False, "error": "not enough battery"}), 400
 
-        # Deduct battery
         s.battery = clamp(s.battery - cost, 0.0, 100.0)
 
-        # Cooldown to prevent ping spam (optional)
         if hasattr(s, 'ping_cooldown') and s.ping_cooldown > time.time():
             return jsonify({"ok": False, "error": "ping recharging"}), 400
-        s.ping_cooldown = time.time() + 5.0  # seconds cooldown
+        s.ping_cooldown = time.time() + 5.0
 
-        # Beam-centered active sonar
         center_world = wrap_angle(s.heading + math.radians(float(center_rel_deg)))
         schedule_active_ping(s, beam, max_r, time.time(), center_world=center_world)
 
-        # Notify all other subs they heard this ping
-        for other in SubModel.query.all():
+        # Notify others
+        others = SubModel.query.all()
+        for other in others:
             if other.id == s.id:
                 continue
             snr = 5.0 * (beam / 90.0) - (distance(s.x, s.y, other.x, other.y) / 800.0)
@@ -945,7 +979,6 @@ def ping(sub_id):
             "battery_cost": round(cost, 2),
             "battery_remaining": round(s.battery, 2)
         })
-
 
 @app.get('/stream')
 def stream():
@@ -986,7 +1019,6 @@ def stream():
     }
     return Response(gen(), headers=headers)
 
-# -------------------------- Admin --------------------------
 @app.get('/admin/state')
 @require_key
 def admin_state():
@@ -1006,7 +1038,11 @@ def admin_state():
         ) for t in TorpedoModel.query.all()]
     return jsonify({"ok": True, "subs": subs, "torpedoes": torps})
 
-# -------------------------- Boot --------------------------
+@app.get('/perf')
+def perf():
+    return jsonify(dict(ok=True, **_perf, queues=len(USER_QUEUES)))
+
+# -------------------------- Admin & boot (Flask 3.x safe) --------------------------
 def ensure_admin():
     admin_user = os.environ.get('SB_ADMIN_USER')
     admin_pass = os.environ.get('SB_ADMIN_PASS')
@@ -1021,55 +1057,57 @@ def ensure_admin():
     elif not u.is_admin:
         u.is_admin = True; db.session.commit()
 
+from threading import Lock
+_loop_started = False
+_loop_lock = Lock()
+
+def _start_loop_once():
+    global _loop_started
+    if _loop_started: return
+    with _loop_lock:
+        if _loop_started: return
+        with app.app_context():
+            ensure_admin()
+        th = threading.Thread(target=game_loop, daemon=True)
+        th.start()
+        _loop_started = True
+        print("[GAME] loop started")
+
+@app.before_request
+def _ensure_loop():
+    if not _loop_started:
+        _start_loop_once()
+
 @app.post('/detonate/<torp_id>')
 @require_key
 def detonate_torp(torp_id):
-    """
-    Owner can command a torpedo to detonate immediately.
-    All subs (except the torpedo's parent sub) within blast_radius
-    and within vertical tolerance are killed (health=0) and notified.
-    """
     with WORLD_LOCK:
         t = TorpedoModel.query.get(torp_id)
         if not t:
             return jsonify({"ok": False, "error": "torpedo not found"}), 404
-        # Only owner may detonate their torpedo
         if t.owner_id != request.user.id:
             return jsonify({"ok": False, "error": "not allowed"}), 403
-
         blast = GAME_CFG.get("torpedo", DEFAULT_CFG["torpedo"])["blast_radius"]
-        # Collect affected subs
         affected = []
         for s in SubModel.query.all():
-            # Optionally skip the firing sub itself (or include if you want friendly-fire)
-            if s.id == t.parent_sub:
-                # include friendly fire if desired; here we include (owner is allowed)
-                pass
             horiz = distance(t.x, t.y, s.x, s.y)
             vert = abs(t.depth - s.depth)
-            # simple 3D sphere test using blast radius
             if math.sqrt(horiz*horiz + vert*vert) <= blast:
                 s.health = 0.0
                 affected.append(s)
-        # notify affected users and any observers
-        for s in affected:
-            send_private(s.owner_id, 'explosion', {
-                "time": time.time(),
-                "at": [t.x, t.y, t.depth],
-                "torpedo_id": t.id,
-                "blast_radius": blast
-            })
-        # finally remove the torpedo
+                send_private(s.owner_id, 'explosion', {
+                    "time": time.time(),
+                    "at": [t.x, t.y, t.depth],
+                    "torpedo_id": t.id,
+                    "blast_radius": blast
+                })
         db.session.delete(t)
         db.session.commit()
         return jsonify({"ok": True, "affected": len(affected)})
-
-
 
 if __name__ == '__main__':
     with app.app_context():
         ensure_admin()
     th = threading.Thread(target=game_loop, daemon=True)
     th.start()
-    # For dev: threaded server is fine now that we tune SQLite + lock snapshots
     app.run(host='0.0.0.0', port=5000, threaded=True)
