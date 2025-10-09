@@ -231,6 +231,9 @@ kbd{background:#0e1b2a;border:1px solid #2c3f57;border-bottom-width:2px;padding:
         <button onclick="torpSetDepth()">Set Depth</button>
         <button onclick="detonateTorp()" style="background:#b22222;color:#fff">Detonate</button>
       </div>
+      <div class="row" style="margin-top:6px">
+        <button id="torpHomingToggle" onclick="torpHomingToggle()">Homing: OFF</button>
+      </div>
     </div>
 
     <div class="section">
@@ -290,10 +293,11 @@ function onSelectTorp(){
   renderTorpSonarList();
   renderTorpPingList();
   
-  // Update ping toggle button state
+  // Update toggle button states
   const torp = torps.find(t => t.id === selectedTorp);
   if(torp) {
     updateTorpPingToggleButton(torp.active_sonar_enabled || false);
+    updateTorpHomingToggleButton(torpHomingStates[selectedTorp] || false);
   }
 }
 
@@ -440,6 +444,92 @@ function updateTorpPingToggleButton(enabled){
   }
 }
 
+let torpHomingStates = {}; // Track homing state per torpedo
+
+async function torpHomingToggle(){
+  if(!selectedTorp){ alert('Select a torpedo first'); return; }
+  const enabled = !torpHomingStates[selectedTorp];
+  torpHomingStates[selectedTorp] = enabled;
+  updateTorpHomingToggleButton(enabled);
+  
+  if(enabled) {
+    startTorpedoHoming(selectedTorp);
+  }
+}
+
+async function startTorpedoHoming(torpId) {
+  if(!torpHomingStates[torpId]) return;
+  
+  const now = performance.now()/1000;
+  
+  // Try active ping contact first (more accurate)
+  let targetBearing = null;
+  let targetDepth = null;
+  
+  const pingContact = torpPingContacts
+    .filter(c => c.torpedo_id === torpId && (now - c.time) <= 10)
+    .sort((a, b) => b.time - a.time)[0];
+  
+  if(pingContact) {
+    // Use ping data for precise targeting
+    const torp = torps.find(t => t.id === torpId);
+    if(torp) {
+      targetBearing = Math.atan2(
+        torp.y + Math.sin(pingContact.bearing) * pingContact.range - torp.y,
+        torp.x + Math.cos(pingContact.bearing) * pingContact.range - torp.x
+      );
+      targetDepth = pingContact.depth;
+    }
+  } else {
+    // Fall back to passive sonar bearing
+    const passiveContact = passiveContacts
+      .filter(c => c.torpedo_id === torpId && c.contact_type.startsWith('torpedo_') && (now - c.time) <= 10)
+      .sort((a, b) => b.time - a.time)[0];
+    
+    if(passiveContact) {
+      targetBearing = passiveContact.bearing;
+      // No depth info from passive, maintain current depth
+      const torp = torps.find(t => t.id === torpId);
+      targetDepth = torp ? torp.depth : null;
+    }
+  }
+  
+  if(targetBearing !== null) {
+    const targetHeadingDeg = (targetBearing * 180 / Math.PI);
+    
+    try {
+      await fetch(`/set_torp_heading/${torpId}`, {
+        method: 'POST',
+        headers: {...auth(), 'Content-Type': 'application/json'},
+        body: JSON.stringify({heading_deg: targetHeadingDeg, dt: 1.0})
+      });
+      
+      if(targetDepth !== null) {
+        await fetch(`/set_torp_depth/${torpId}`, {
+          method: 'POST', 
+          headers: {...auth(), 'Content-Type': 'application/json'},
+          body: JSON.stringify({depth: targetDepth})
+        });
+      }
+    } catch(e) {
+      console.log('Homing command failed:', e);
+    }
+  }
+  
+  // Continue homing every 2 seconds
+  if(torpHomingStates[torpId]) {
+    setTimeout(() => startTorpedoHoming(torpId), 2000);
+  }
+}
+
+function updateTorpHomingToggleButton(enabled){
+  const btn = $('torpHomingToggle');
+  if(btn) {
+    btn.textContent = enabled ? 'Homing: ON' : 'Homing: OFF';
+    btn.style.backgroundColor = enabled ? '#ff6600' : '';
+  }
+}
+
 async function detonateTorp(){
   if(!selectedTorp){ alert('Select a torpedo first'); return; }
   if(!confirm('Detonate torpedo '+selectedTorp.slice(0,8)+'?')) return;
@@ -540,13 +630,12 @@ function renderTorpSonarList(){
   const now=performance.now()/1000;
   const torpContacts = passiveContacts.filter(c=>c.torpedo_id===selectedTorp && c.contact_type.startsWith('torpedo_') && (now-c.time)<=PASSIVE_TTL).slice(0,8);
   const rows=torpContacts.map(c=>{
-    const brg=(c.bearing*180/Math.PI).toFixed(0);
     const relBrg = c.bearing_relative ? (c.bearing_relative*180/Math.PI).toFixed(0) : '?';
     const contactIcon = '🎯';
     const direction = Math.abs(parseFloat(relBrg)) < 45 ? 'ahead' :
                      Math.abs(parseFloat(relBrg)) > 135 ? 'astern' :
                      parseFloat(relBrg) > 0 ? 'starboard' : 'port';
-    return `${contactIcon} ${direction} ${brg}° ${c.range_class}`;
+    return `${contactIcon} ${direction} ${relBrg}° ${c.range_class}`;
   });
   $('torpSonarList').innerHTML = rows.join('<br>') || '—';
 }
@@ -555,10 +644,19 @@ function renderTorpPingList(){
   const now=performance.now()/1000;
   const pingContacts = torpPingContacts.filter(c=>c.torpedo_id===selectedTorp && (now-c.time)<=PASSIVE_TTL).slice(0,8);
   const rows=pingContacts.map(c=>{
-    const brg=(c.bearing*180/Math.PI).toFixed(0);
+    const torp = torps.find(t => t.id === selectedTorp);
+    let relBrg = '?';
+    if(torp) {
+      const relativeBearing = c.bearing - torp.heading;
+      // Normalize to -180 to +180 range
+      let normalized = relativeBearing;
+      while(normalized > Math.PI) normalized -= 2 * Math.PI;
+      while(normalized < -Math.PI) normalized += 2 * Math.PI;
+      relBrg = (normalized * 180 / Math.PI).toFixed(0);
+    }
     const rng=Math.round(c.range);
     const dep=Math.round(c.depth);
-    return `📡 ${brg}° ${rng}m d${dep}m`;
+    return `📡 ${relBrg}° ${rng}m d${dep}m`;
   });
   $('torpPingList').innerHTML = rows.join('<br>') || '—';
 }
