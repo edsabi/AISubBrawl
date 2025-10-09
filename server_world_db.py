@@ -6,6 +6,7 @@ from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import text
 from sqlalchemy.orm.exc import StaleDataError
 from werkzeug.security import generate_password_hash, check_password_hash
+from functools import wraps  # <-- added
 
 # -------------------------- Defaults --------------------------
 DEFAULT_CFG = {
@@ -25,7 +26,7 @@ DEFAULT_CFG = {
         "neutral_bias": 0.008,
         "depth_damping": 0.35,
         "snorkel_depth": 15.0,
-        "snorkel_off_hysteresis": 2.0,  # <-- new: prevents flapping at the limit
+        "snorkel_off_hysteresis": 2.0,  # <-- prevents flapping at the limit
         "emergency_blow": {
             "duration_s": 10.0,
             "upward_mps": 5.0,
@@ -214,13 +215,13 @@ def get_user_from_api():
     return User.query.get(ak.user_id)
 
 def require_key(fn):
+    @wraps(fn)  # <-- keeps name/docs for flask
     def w(*a, **kw):
         u = get_user_from_api()
         if not u:
             return jsonify({"ok": False, "error": "Invalid api key"}), 401
         request.user = u
         return fn(*a, **kw)
-    w.__name__ = fn.__name__
     return w
 
 # -------------------------- SSE per-user --------------------------
@@ -309,7 +310,9 @@ def random_spawn_pos():
     return cx, cy
 
 # -------------------------- Game logic --------------------------
-PENDING_PINGS = []  # active sonar echoes waiting to return
+# Active sonar echoes waiting to return
+PENDING_PINGS = []
+PENDING_PINGS_LOCK = threading.RLock()  # <-- NEW
 
 def update_sub(s: SubModel, dt: float, now: float):
     scfg = GAME_CFG.get("sub", DEFAULT_CFG["sub"])
@@ -435,14 +438,10 @@ def explode_torpedo_in_mem(t: TorpedoModel, subs: List[SubModel], pending_events
         d = distance3d(t.x, t.y, t.depth, s.x, s.y, s.depth)
         if d <= blast and s.health > 0.0:
             # Graduated damage based on distance
-            if d <= 60.0:  # Instant kill zone
-                damage = 100.0
-            elif d <= 80.0:  # Severe damage zone
-                damage = 75.0
-            elif d <= 100.0:  # Heavy damage zone
-                damage = 50.0
-            else:  # Light damage zone (60-120m)
-                damage = 25.0
+            if d <= 60.0:      damage = 100.0
+            elif d <= 80.0:    damage = 75.0
+            elif d <= 100.0:   damage = 50.0
+            else:              damage = 25.0
             
             s.health = max(0.0, s.health - damage)
             pending_events.append((
@@ -510,13 +509,9 @@ def update_torpedo(t: TorpedoModel, dt: float, now: float):
         return
 
     # Proximity fuze check flag (blast handled later)
-    # Don't arm if too close to launching submarine
     min_safe_distance = 150.0  # 150m minimum safe distance
-    too_close_to_parent = False
     if hasattr(t, 'parent_sub') and t.parent_sub:
-        # We'll check parent distance in the explosion processing where subs are available
         pass
-    
     t._check_prox = prox > 0.0 and (now - t.created_at) >= cfg.get("arming_delay_s", 1.0)
     t._min_safe_distance = min_safe_distance  # Store for later use
 
@@ -575,15 +570,14 @@ def schedule_passive_contacts(now: float, subs: List[SubModel], torps: List[Torp
                 continue
             speed_noise = pcfg["speed_noise_gain"] * (tgt.speed / subcfg["max_speed"])
             snorkel_bonus = pcfg["snorkel_bonus"] if tgt.is_snorkeling else 0.0
-            
-            # Emergency blow creates massive acoustic signature
             blow_bonus = 25.0 if tgt.blow_active else 0.0
-            
+
+            rng = distance(obs.x, obs.y, tgt.x, tgt.y)  # <-- compute before logging
+
             if tgt.blow_active:
                 print(f"[DEBUG] Emergency blow detected: sub {tgt.id[:6]} at range {rng:.0f}m")
             
             base = pcfg["base_snr"] + speed_noise + snorkel_bonus + blow_bonus
-            rng = distance(obs.x, obs.y, tgt.x, tgt.y)
             
             # Emergency blow can be heard from much farther
             max_range = 8000.0 if tgt.blow_active else acfg["max_range"]
@@ -664,6 +658,12 @@ def schedule_passive_contacts(now: float, subs: List[SubModel], torps: List[Torp
             if rng > torp_sonar_cfg["max_range"]:
                 continue
                 
+            # Check if target is within 210Â° beam (105Â° each side, 150Â° baffle astern)
+            brg = math.atan2(tgt.y - torp.y, tgt.x - torp.x)
+            rel_bearing = wrap_angle(brg - torp.heading)
+            if abs(rel_bearing) > math.radians(105.0):  # 210Â° beam = Â±105Â°
+                continue
+                
             # Calculate detection probability based on target noise
             speed_noise = pcfg["speed_noise_gain"] * (tgt.speed / subcfg["max_speed"])
             snorkel_bonus = pcfg["snorkel_bonus"] if tgt.is_snorkeling else 0.0
@@ -674,7 +674,6 @@ def schedule_passive_contacts(now: float, subs: List[SubModel], torps: List[Torp
             if snr < 3.0:  # Lower threshold for torpedo sonar
                 continue
                 
-            brg = math.atan2(tgt.y - torp.y, tgt.x - torp.x)
             jitter = math.radians(torp_sonar_cfg["bearing_jitter_deg"])
             brg = wrap_angle(brg + random.uniform(-jitter, jitter))
             
@@ -706,7 +705,7 @@ def schedule_passive_contacts(now: float, subs: List[SubModel], torps: List[Torp
         if now - getattr(torp, 'last_active_ping', 0.0) < torp_active_cfg.get("ping_interval_s", 3.0):
             continue
             
-        # Auto-ping with fixed 30Ã‚Â° beam
+        # Auto-ping with fixed 30Â° beam
         contacts = []
         for s in subs:
             if s.owner_id == torp.owner_id:
@@ -717,7 +716,7 @@ def schedule_passive_contacts(now: float, subs: List[SubModel], torps: List[Torp
                 continue
             brg = math.atan2(dy, dx)
             rel = abs(wrap_angle(brg - torp.heading))
-            if rel > math.radians(15.0):  # 30Ã‚Â° beam = Ã‚Â±15Ã‚Â°
+            if rel > math.radians(15.0):  # 30Â° beam = Â±15Â°
                 continue
             contacts.append({
                 "bearing": brg,
@@ -757,21 +756,24 @@ def schedule_active_ping(obs: SubModel, beam_deg: float, max_range: float, now: 
         echo_lvl = 18.0 - (rng3d / 400.0) + (8.0 if tgt.is_snorkeling else 0.0) + beam_focus_bonus
         c = acfg["sound_speed"]
         eta = now + 2.0 * (rng3d / c)
-        PENDING_PINGS.append({
-            'eta': eta,
-            'rng': rng3d,
-            'bearing': brg_world,
-            'echo_level': echo_lvl,
-            'observer_sub_id': obs.id,
-            'observer_user_id': obs.owner_id,
-            'observer_depth': float(obs.depth),
-            'target_depth': float(tgt.depth)
-        })
+        with PENDING_PINGS_LOCK:  # <-- thread-safe append
+            PENDING_PINGS.append({
+                'eta': eta,
+                'rng': rng3d,
+                'bearing': brg_world,
+                'echo_level': echo_lvl,
+                'observer_sub_id': obs.id,
+                'observer_user_id': obs.owner_id,
+                'observer_depth': float(obs.depth),
+                'target_depth': float(tgt.depth)
+            })
 
 def process_active_pings(now: float):
-    due = [p for p in PENDING_PINGS if p['eta'] <= now]
-    if not due: return
-    PENDING_PINGS[:] = [p for p in PENDING_PINGS if p['eta'] > now]
+    with PENDING_PINGS_LOCK:
+        due = [p for p in PENDING_PINGS if p['eta'] <= now]
+        if not due: 
+            return
+        PENDING_PINGS[:] = [p for p in PENDING_PINGS if p['eta'] > now]
     acfg = GAME_CFG.get("sonar", {}).get("active", DEFAULT_CFG["sonar"]["active"])
     for p in due:
         lvl = float(p['echo_level'])
@@ -1114,7 +1116,7 @@ def launch_torpedo(sub_id):
             heading=s.heading,
             speed=GAME_CFG.get("torpedo", DEFAULT_CFG["torpedo"])["speed"],
             control_mode='wire',
-            wire_length=torpedo_range  # Now stores max range instead of wire length
+            wire_length=torpedo_range  # stores max range instead of wire length
         )
         t.created_at = time.time()
         db.session.add(t)
@@ -1148,17 +1150,20 @@ def set_torp_speed(torp_id):
 def torp_ping(torp_id):
     d = request.get_json(force=True)
     beam = 30.0  # Fixed 30-degree beam angle
-    max_r = float(d.get('max_range', 800.0))
+    max_r_req = float(d.get('max_range', 800.0))
     
     with WORLD_LOCK:
         t = TorpedoModel.query.get(torp_id)
         if not t or t.owner_id != request.user.id:
             return jsonify({"ok": False, "error": "not found"}), 404
             
-        # Torpedo active sonar (no wire restriction)
-        cfg = GAME_CFG["torpedo"]["sonar"]["active"]
-        max_r = min(max_r, cfg["max_range"])
-        beam = min(beam, cfg["max_angle"])
+        # Safe config access with defaults
+        cfg_active = (GAME_CFG.get("torpedo", {})
+                               .get("sonar", {})
+                               .get("active", {"max_range": 1500.0, "rng_sigma_m": 40.0, "max_angle": 60.0}))
+        max_r = min(max_r_req, cfg_active.get("max_range", 1500.0))
+        beam = min(beam, cfg_active.get("max_angle", 60.0))
+        rng_sigma = cfg_active.get("rng_sigma_m", 40.0)
         
         contacts = []
         for s in SubModel.query.all():
@@ -1174,7 +1179,7 @@ def torp_ping(torp_id):
                 continue
             contacts.append({
                 "bearing": brg,
-                "range": rng + random.uniform(-cfg["rng_sigma_m"], cfg["rng_sigma_m"]),
+                "range": rng + random.uniform(-rng_sigma, rng_sigma),
                 "depth": s.depth + random.uniform(-20, 20)
             })
         
@@ -1263,14 +1268,14 @@ def ping(sub_id):
         if not s or s.owner_id != request.user.id:
             return jsonify({"ok": False, "error": "not found"}), 404
 
-        # New battery cost calculation based on angle and range
+        # Battery cost calculation based on angle and range
         power_cfg = GAME_CFG.get("sonar", {}).get("active_power", DEFAULT_CFG["sonar"]["active_power"])
-        base_cost = power_cfg.get("base_cost", 0.5)
-        angle_cost = beam * power_cfg.get("cost_per_degree", 0.05)
-        range_cost = (max_r / 100.0) * power_cfg.get("cost_per_100m_range", 0.02)
+        base_cost = power_cfg.get("base_cost", DEFAULT_CFG["sonar"]["active_power"]["base_cost"])
+        angle_cost = beam * power_cfg.get("cost_per_degree", DEFAULT_CFG["sonar"]["active_power"]["cost_per_degree"])  # <-- 0.04 default
+        range_cost = (max_r / 100.0) * power_cfg.get("cost_per_100m_range", DEFAULT_CFG["sonar"]["active_power"]["cost_per_100m_range"])
         cost = base_cost + angle_cost + range_cost
         
-        if s.battery < power_cfg.get("min_battery", 5.0):
+        if s.battery < power_cfg.get("min_battery", DEFAULT_CFG["sonar"]["active_power"]["min_battery"]):
             return jsonify({"ok": False, "error": "battery too low"}), 400
         if s.battery < cost:
             return jsonify({"ok": False, "error": "not enough battery"}), 400
@@ -1430,14 +1435,10 @@ def detonate_torp(torp_id):
             d = math.sqrt(horiz*horiz + vert*vert)
             if d <= blast:
                 # Graduated damage based on distance
-                if d <= 60.0:  # Instant kill zone
-                    damage = 100.0
-                elif d <= 80.0:  # Severe damage zone
-                    damage = 75.0
-                elif d <= 100.0:  # Heavy damage zone
-                    damage = 50.0
-                else:  # Light damage zone (60-120m)
-                    damage = 25.0
+                if d <= 60.0:      damage = 100.0
+                elif d <= 80.0:    damage = 75.0
+                elif d <= 100.0:   damage = 50.0
+                else:              damage = 25.0
                 
                 s.health = max(0.0, s.health - damage)
                 affected.append(s)
@@ -1456,6 +1457,5 @@ def detonate_torp(torp_id):
 if __name__ == '__main__':
     with app.app_context():
         ensure_admin()
-    th = threading.Thread(target=game_loop, daemon=True)
-    th.start()
+    _start_loop_once()  # <-- single source of truth; prevents double-start
     app.run(host='0.0.0.0', port=5000, threaded=True)
