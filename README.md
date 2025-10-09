@@ -153,7 +153,6 @@ For full details and examples, open **api.md** below.
 
 ## License
 
-MIT (or your preferred license). Replace this section accordingly.
 
 ---
 
