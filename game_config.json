@@ -31,7 +31,7 @@
       "initial_max": 80.0,
       "drain_per_throttle_per_s": 0.1,
       "high_speed_multiplier": 15.0,
-      "recharge_per_s_snorkel": 0.25
+      "recharge_per_s_snorkel": 1
     },
 
     "crush_depth": 500.0,
@@ -41,8 +41,8 @@
   "torpedo": {
     "speed": 18.0,
     "min_speed": 8.0,
-    "max_speed": 18.0,
-    "turn_rate_deg_s": 30.0,
+    "max_speed": 24.0,
+    "turn_rate_deg_s": 22.0,
     "depth_rate_m_s": 6.0,
     "blast_radius": 120.0,
     "lifetime_s": 240.0,
