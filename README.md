@@ -153,10 +153,11 @@ For full details and examples, open **api.md** below.
 
 ## License
 
+MIT (or your preferred license). Replace this section accordingly.
 
 ---
 
-
+# api.md
 
 ## Sub Brawl HTTP API
 
@@ -410,38 +411,195 @@ Perf counters + queue count.
 
 ---
 
-## Examples
+## Examples — cURL cookbook (per endpoint)
 
-### Minimal control loop (bash+cURL)
+> Assumes `HOST=http://localhost:5000` and `API=<your_api_key>` in your shell.
 
 ```bash
-API=…
-SUB=$(curl -sX POST "localhost:5000/register_sub?api_key=$API" | jq -r .sub_id)
-# Throttle up and hold 120m
-curl -sX POST -H "Authorization: Bearer $API" \
-  -H 'content-type: application/json' \
-  -d '{"throttle":0.6, "target_depth":120}' \
-  localhost:5000/control/$SUB
-# Active ping ahead, 20° beam, 2000m
-curl -sX POST -H "Authorization: Bearer $API" \
-  -H 'content-type: application/json' \
-  -d '{"beamwidth_deg":20, "max_range":2000, "center_bearing_deg":0}' \
-  localhost:5000/ping/$SUB
+HOST=http://localhost:5000
+API=REPLACE_ME
 ```
 
-### Launch and guide a torpedo
+### Auth & Session
+
+**Signup**
 
 ```bash
-TID=$(curl -sX POST -H "Authorization: Bearer $API" \
-  -H 'content-type: application/json' \
-  -d '{"range":1200}' localhost:5000/launch_torpedo/$SUB | jq -r .torpedo_id)
-# Turn right 15° over the next tick
-curl -sX POST -H "Authorization: Bearer $API" \
-  -H 'content-type: application/json' \
-  -d '{"turn_deg":15}' localhost:5000/set_torp_heading/$TID
-# Drop to 140m
+curl -sX POST "$HOST/signup" -H 'content-type: application/json' \
+  -d '{"username":"captain","password":"secret"}' | jq
+```
+
+**Login**
+
+```bash
+curl -sX POST "$HOST/login" -H 'content-type: application/json' \
+  -d '{"username":"captain","password":"secret"}' | jq
+```
+
+**SSE Stream**
+
+```bash
+# Using header
+curl -N -H "Authorization: Bearer $API" "$HOST/stream"
+# Or query param
+curl -N "$HOST/stream?api_key=$API"
+```
+
+---
+
+### World & Config
+
+**Public info**
+
+```bash
+curl -s "$HOST/public" | jq
+```
+
+**Rules / Effective config**
+
+```bash
+curl -s "$HOST/rules" | jq
+```
+
+**Your state (subs & torps)**
+
+```bash
+curl -s -H "Authorization: Bearer $API" "$HOST/state" | jq
+```
+
+**Register a submarine**
+
+```bash
+curl -sX POST "$HOST/register_sub?api_key=$API" | jq
+```
+
+---
+
+### Submarine Control
+
+**/control — throttle, planes, rudder, depth‑hold**
+
+```bash
+SUB=REPLACE_WITH_SUB_ID
 curl -sX POST -H "Authorization: Bearer $API" -H 'content-type: application/json' \
-  -d '{"depth":140}' localhost:5000/set_torp_depth/$TID
+  -d '{"throttle":0.6, "planes":0.2, "rudder_deg":10, "target_depth":120}' \
+  "$HOST/control/$SUB" | jq
+```
+
+**/snorkel — toggle**
+
+```bash
+curl -sX POST -H "Authorization: Bearer $API" "$HOST/snorkel/$SUB" | jq
+```
+
+**/snorkel — force on/off**
+
+```bash
+# Force ON (must be shallower than snorkel depth)
+curl -sX POST -H "Authorization: Bearer $API" -H 'content-type: application/json' \
+  -d '{"on":true}' "$HOST/snorkel/$SUB" | jq
+# Force OFF
+curl -sX POST -H "Authorization: Bearer $API" -H 'content-type: application/json' \
+  -d '{"on":false}' "$HOST/snorkel/$SUB" | jq
+```
+
+**/emergency_blow**
+
+```bash
+curl -sX POST -H "Authorization: Bearer $API" "$HOST/emergency_blow/$SUB" | jq
+```
+
+**/ping — active sonar**
+
+```bash
+curl -sX POST -H "Authorization: Bearer $API" -H 'content-type: application/json' \
+  -d '{"beamwidth_deg":20, "max_range":2000, "center_bearing_deg":0}' \
+  "$HOST/ping/$SUB" | jq
+```
+
+**/set_passive_array — steer the array**
+
+```bash
+curl -sX POST -H "Authorization: Bearer $API" -H 'content-type: application/json' \
+  -d '{"dir_deg":135}' "$HOST/set_passive_array/$SUB" | jq
+```
+
+---
+
+### Torpedoes
+
+**/launch_torpedo — fire wire‑guided torp**
+
+```bash
+curl -sX POST -H "Authorization: Bearer $API" -H 'content-type: application/json' \
+  -d '{"range":1200}' "$HOST/launch_torpedo/$SUB" | jq
+# Save torpedo id
+TID=$(curl -sX POST -H "Authorization: Bearer $API" -H 'content-type: application/json' \
+  -d '{"range":1200}' "$HOST/launch_torpedo/$SUB" | jq -r .torpedo_id)
+```
+
+**/set_torp_speed**
+
+```bash
+curl -sX POST -H "Authorization: Bearer $API" -H 'content-type: application/json' \
+  -d '{"speed":16}' "$HOST/set_torp_speed/$TID" | jq
+```
+
+**/set_torp_depth**
+
+```bash
+curl -sX POST -H "Authorization: Bearer $API" -H 'content-type: application/json' \
+  -d '{"depth":140}' "$HOST/set_torp_depth/$TID" | jq
+```
+
+**/set_torp_heading — absolute**
+
+```bash
+curl -sX POST -H "Authorization: Bearer $API" -H 'content-type: application/json' \
+  -d '{"heading_deg": 60}' "$HOST/set_torp_heading/$TID" | jq
+```
+
+**/set_torp_heading — relative turn with dt**
+
+```bash
+curl -sX POST -H "Authorization: Bearer $API" -H 'content-type: application/json' \
+  -d '{"turn_deg": 15, "dt": 0.1}' "$HOST/set_torp_heading/$TID" | jq
+```
+
+**/torp_ping — active torp ping**
+
+```bash
+curl -sX POST -H "Authorization: Bearer $API" -H 'content-type: application/json' \
+  -d '{"max_range":800}' "$HOST/torp_ping/$TID" | jq
+```
+
+**/torp_ping_toggle — enable/disable auto‑ping**
+
+```bash
+curl -sX POST -H "Authorization: Bearer $API" "$HOST/torp_ping_toggle/$TID" | jq
+```
+
+**/detonate — manual detonation**
+
+```bash
+curl -sX POST -H "Authorization: Bearer $API" "$HOST/detonate/$TID" | jq
+```
+
+---
+
+### Admin & Perf
+
+**/admin/state — admin only**
+
+```bash
+# Requires the API key for a user marked is_admin=true
+curl -s -H "Authorization: Bearer $API" "$HOST/admin/state" | jq
+```
+
+**/perf — server timings**
+
+```bash
+curl -s "$HOST/perf" | jq
 ```
 
 ---
