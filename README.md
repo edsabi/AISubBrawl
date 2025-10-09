@@ -157,7 +157,7 @@ MIT (or your preferred license). Replace this section accordingly.
 
 ---
 
-# api.md
+
 
 ## Sub Brawl HTTP API
 
