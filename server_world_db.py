@@ -20,13 +20,14 @@ DEFAULT_CFG = {
     "sub": {
         "max_speed": 12.0,
         "acceleration": 2.0,
-        "yaw_rate_deg_s": 20.0,
+        "yaw_rate_deg_s": 3.0,
         "pitch_rate_deg_s": 12.0,
         "planes_effect": 1.0,
         "neutral_bias": 0.008,
         "depth_damping": 0.35,
         "snorkel_depth": 15.0,
         "snorkel_off_hysteresis": 2.0,  # <-- prevents flapping at the limit
+        "max_per_user": 2,  # Maximum submarines per user
         "emergency_blow": {
             "duration_s": 10.0,
             "upward_mps": 5.0,
@@ -45,7 +46,7 @@ DEFAULT_CFG = {
     },
     "torpedo": {
         "speed": 12.0,
-        "turn_rate_deg_s": 30.0,
+        "turn_rate_deg_s": 5.0,
         "depth_rate_m_s": 6.0,
         "blast_radius": 60.0,
         "lifetime_s": 240.0,
@@ -142,6 +143,7 @@ class SubModel(db.Model):
     planes = db.Column(db.Float, default=0.0)        # -1..1 manual
     throttle = db.Column(db.Float, default=0.2)      # 0..1
     target_depth = db.Column(db.Float, default=None)
+    target_heading = db.Column(db.Float, default=None)  # radians, target heading for auto-steering
     speed = db.Column(db.Float, default=0.0)
     battery = db.Column(db.Float, default=50.0)
     is_snorkeling = db.Column(db.Boolean, default=False)
@@ -162,6 +164,7 @@ class TorpedoModel(db.Model):
     depth = db.Column(db.Float, default=100.0)
     target_depth = db.Column(db.Float, default=None)
     heading = db.Column(db.Float, default=0.0)
+    target_heading = db.Column(db.Float, default=None)  # radians, target heading for auto-steering
     speed = db.Column(db.Float, default=lambda: GAME_CFG.get("torpedo", {}).get("speed", DEFAULT_CFG["torpedo"]["speed"]))
     target_speed = db.Column(db.Float, default=lambda: GAME_CFG.get("torpedo", {}).get("speed", DEFAULT_CFG["torpedo"]["speed"]))
     created_at = db.Column(db.Float, default=lambda: time.time())
@@ -248,7 +251,7 @@ def _sub_pub(s: SubModel):
         rudder_angle=s.rudder_angle, rudder_cmd=s.rudder_cmd, planes=s.planes,
         speed=s.speed, battery=s.battery, is_snorkeling=s.is_snorkeling,
         blow_active=s.blow_active, blow_charge=s.blow_charge, health=s.health,
-        target_depth=s.target_depth, throttle=s.throttle
+        target_depth=s.target_depth, target_heading=s.target_heading, throttle=s.throttle
     )
 
 def _torp_pub(t: TorpedoModel):
@@ -257,7 +260,9 @@ def _torp_pub(t: TorpedoModel):
                 passive_sonar_active=t.passive_sonar_active, 
                 passive_sonar_bearing=t.passive_sonar_bearing,
                 last_sonar_contact=t.last_sonar_contact,
-                active_sonar_enabled=getattr(t, 'active_sonar_enabled', False))
+                active_sonar_enabled=getattr(t, 'active_sonar_enabled', False),
+                target_heading=getattr(t, 'target_heading', None),
+                target_depth=getattr(t, 'target_depth', None))
 
 def send_snapshot(user_id: int):
     with WORLD_LOCK:
@@ -342,12 +347,23 @@ def update_sub(s: SubModel, dt: float, now: float):
         s.rudder_angle = clamp(s.rudder_angle, -MAX_RUDDER_RAD, MAX_RUDDER_RAD)
     # else: rudder stays in current position when battery dead
 
-    # Heading integration
-    rudder_frac = 0.0 if MAX_RUDDER_RAD == 0 else (s.rudder_angle / MAX_RUDDER_RAD)
-    s.heading = wrap_angle(s.heading + yaw_rate_rad * rudder_frac * dt)
+    # Auto-steering to target heading
+    if s.target_heading is not None:
+        heading_error = wrap_angle(s.target_heading - s.heading)
+        # Use proportional control to steer toward target heading
+        max_turn_rate = math.radians(scfg.get("yaw_rate_deg_s", 3.0))  # degrees per second
+        turn_rate = clamp(heading_error * 0.5, -max_turn_rate, max_turn_rate)  # P=0.5
+        s.heading = wrap_angle(s.heading + turn_rate * dt)
+        # Clear target heading when close enough (within 2 degrees)
+        if abs(heading_error) < math.radians(2.0):
+            s.target_heading = None
+    else:
+        # Manual rudder control
+        rudder_frac = 0.0 if MAX_RUDDER_RAD == 0 else (s.rudder_angle / MAX_RUDDER_RAD)
+        s.heading = wrap_angle(s.heading + yaw_rate_rad * rudder_frac * dt)
 
     # Planes -> pitch - also requires battery
-    target_pitch = clamp(s.planes * planes_eff, -1.0, 1.0) * math.radians(20.0)
+    target_pitch = clamp(s.planes * planes_eff, -1.0, 1.0) * math.radians(30.0)
     if s.battery > 0.0:
         s.pitch += clamp(target_pitch - s.pitch, -pitch_rate*dt, pitch_rate*dt)
     # else: planes stay in current position when battery dead
@@ -388,7 +404,7 @@ def update_sub(s: SubModel, dt: float, now: float):
     autopilot_on = (s.target_depth is not None) and (abs(s.planes) < 0.05)
     if autopilot_on:
         err_m = s.target_depth - s.depth
-        ap_pitch = clamp(-err_m * math.radians(0.5), -math.radians(25), math.radians(25))
+        ap_pitch = clamp(-err_m * math.radians(0.5), -math.radians(30), math.radians(30))
         s.pitch += clamp(ap_pitch - s.pitch, -pitch_rate*dt, pitch_rate*dt)
         v_down += clamp(err_m * 0.02, -1.5, 1.5)
 
@@ -966,6 +982,13 @@ def state():
 @require_key
 def register_sub():
     with WORLD_LOCK:
+        # Check submarine limit per user
+        max_subs_per_user = GAME_CFG.get("sub", {}).get("max_per_user", DEFAULT_CFG["sub"].get("max_per_user", 2))
+        current_subs = SubModel.query.filter_by(owner_id=request.user.id).count()
+        
+        if current_subs >= max_subs_per_user:
+            return jsonify({"ok": False, "error": f"Maximum {max_subs_per_user} submarines per user"}), 400
+        
         x, y = random_spawn_pos()
         bcfg = GAME_CFG.get("sub", {}).get("battery", DEFAULT_CFG["sub"]["battery"])
         bmin = bcfg.get("initial_min", DEFAULT_CFG["sub"]["battery"]["initial_min"])
@@ -1166,22 +1189,36 @@ def torp_ping(torp_id):
         rng_sigma = cfg_active.get("rng_sigma_m", 40.0)
         
         contacts = []
+        print(f"[DEBUG] Torpedo ping: torp_id={torp_id[:6]}, pos=({t.x:.1f},{t.y:.1f},{t.depth:.1f}), heading={math.degrees(t.heading):.1f}°, max_r={max_r}, beam={beam}°")
+        
         for s in SubModel.query.all():
             if s.owner_id == t.owner_id:
+                print(f"[DEBUG] Skipping own submarine: {s.id[:6]}")
                 continue
             dx = s.x - t.x; dy = s.y - t.y
             rng = math.sqrt(dx*dx + dy*dy + (s.depth - t.depth)**2)
-            if rng > max_r:
-                continue
             brg = math.atan2(dy, dx)
             rel = abs(wrap_angle(brg - t.heading))
-            if rel > math.radians(beam / 2.0):
+            rel_deg = math.degrees(rel)
+            beam_half = beam / 2.0
+            
+            print(f"[DEBUG] Sub {s.id[:6]}: pos=({s.x:.1f},{s.y:.1f},{s.depth:.1f}), dist={rng:.1f}m, bearing={math.degrees(brg):.1f}°, rel={rel_deg:.1f}°, beam_half={beam_half:.1f}°")
+            
+            if rng > max_r:
+                print(f"[DEBUG] Sub {s.id[:6]}: OUT OF RANGE ({rng:.1f}m > {max_r}m)")
                 continue
+            if rel > math.radians(beam_half):
+                print(f"[DEBUG] Sub {s.id[:6]}: OUT OF BEAM ({rel_deg:.1f}° > {beam_half:.1f}°)")
+                continue
+                
+            print(f"[DEBUG] Sub {s.id[:6]}: CONTACT DETECTED!")
             contacts.append({
                 "bearing": brg,
                 "range": rng + random.uniform(-rng_sigma, rng_sigma),
                 "depth": s.depth + random.uniform(-20, 20)
             })
+        
+        print(f"[DEBUG] Torpedo ping result: {len(contacts)} contacts")
         
         return jsonify({"ok": True, "contacts": contacts})
 
@@ -1236,6 +1273,135 @@ def set_torp_heading(torp_id):
         t.updated_at = time.time()
         db.session.commit()
         return jsonify({'ok': True, 'torpedo': dict(id=t.id, heading=t.heading)})
+
+@app.post('/set_torp_target_heading/<torp_id>')
+@require_key
+def set_torp_target_heading(torp_id):
+    d = request.get_json(force=True)
+    with WORLD_LOCK:
+        t = TorpedoModel.query.get(torp_id)
+        if not t or t.owner_id != request.user.id:
+            return jsonify({'ok': False, 'error': 'not found'}), 404
+        if t.control_mode != 'wire':
+            return jsonify({'ok': False, 'error': 'wire lost'}), 400
+        
+        if 'heading_deg' in d:
+            if d['heading_deg'] is None:
+                t.target_heading = None
+            else:
+                # Convert from compass degrees (0°=North, 90°=East) to server radians (0=east, CCW+)
+                compass_deg = float(d['heading_deg'])
+                server_deg = (90 - compass_deg) % 360
+                desired = math.radians(server_deg)
+                t.target_heading = desired
+        else:
+            return jsonify({'ok': False, 'error': 'heading_deg required'}), 400
+        
+        t.updated_at = time.time()
+        db.session.commit()
+        # Convert back to compass degrees for response
+        compass_heading = (t.heading * 180 / math.pi + 90) % 360
+        compass_target = (t.target_heading * 180 / math.pi + 90) % 360 if t.target_heading else None
+        return jsonify({'ok': True, 'torpedo': dict(
+            id=t.id, 
+            heading=t.heading, 
+            target_heading=t.target_heading,
+            compass_heading=compass_heading,
+            compass_target=compass_target
+        )})
+
+@app.post('/torp_passive_sonar_toggle/<torp_id>')
+@require_key
+def torp_passive_sonar_toggle(torp_id):
+    with WORLD_LOCK:
+        t = TorpedoModel.query.get(torp_id)
+        if not t or t.owner_id != request.user.id:
+            return jsonify({'ok': False, 'error': 'not found'}), 404
+        if t.control_mode != 'wire':
+            return jsonify({'ok': False, 'error': 'wire lost'}), 400
+        
+        t.passive_sonar_active = not t.passive_sonar_active
+        t.updated_at = time.time()
+        db.session.commit()
+        return jsonify({'ok': True, 'passive_sonar_active': t.passive_sonar_active})
+
+
+@app.post('/set_sub_heading/<sub_id>')
+@require_key
+def set_sub_heading(sub_id):
+    d = request.get_json(force=True)
+    with WORLD_LOCK:
+        s = SubModel.query.get(sub_id)
+        if not s or s.owner_id != request.user.id:
+            return jsonify({'ok': False, 'error': 'not found'}), 404
+        
+        if 'heading_deg' in d:
+            if d['heading_deg'] is None:
+                s.target_heading = None
+            else:
+                # Convert from compass degrees (0°=North, 90°=East) to server radians (0=east, CCW+)
+                compass_deg = float(d['heading_deg'])
+                # Convert: North(0°) -> East(90°) -> South(180°) -> West(270°)
+                # Server: East(0°) -> North(90°) -> West(180°) -> South(270°)
+                # Formula: server_deg = (90 - compass_deg) % 360
+                server_deg = (90 - compass_deg) % 360
+                desired = math.radians(server_deg)
+                s.target_heading = desired
+                print(f"[DEBUG] Heading conversion: UI {compass_deg}° -> Server {server_deg}° ({desired:.3f} rad)")
+        else:
+            return jsonify({'ok': False, 'error': 'heading_deg required'}), 400
+        
+        s.updated_at = time.time()
+        db.session.commit()
+        # Convert back to compass degrees for response
+        compass_heading = (s.heading * 180 / math.pi + 90) % 360
+        compass_target = (s.target_heading * 180 / math.pi + 90) % 360 if s.target_heading else None
+        return jsonify({'ok': True, 'submarine': dict(
+            id=s.id, 
+            heading=s.heading, 
+            target_heading=s.target_heading,
+            compass_heading=compass_heading,
+            compass_target=compass_target
+        )})
+
+@app.post('/turn_sub/<sub_id>')
+@require_key
+def turn_sub(sub_id):
+    d = request.get_json(force=True)
+    with WORLD_LOCK:
+        s = SubModel.query.get(sub_id)
+        if not s or s.owner_id != request.user.id:
+            return jsonify({'ok': False, 'error': 'not found'}), 404
+        
+        if 'turn_deg' not in d:
+            return jsonify({'ok': False, 'error': 'turn_deg required'}), 400
+        
+        turn_deg = float(d['turn_deg'])
+        # Convert turn degrees to radians and add to current heading
+        turn_rad = math.radians(turn_deg)
+        new_heading = wrap_angle(s.heading + turn_rad)
+        
+        # Convert to compass degrees for target heading
+        compass_deg = (new_heading * 180 / math.pi + 90) % 360
+        server_deg = (90 - compass_deg) % 360
+        s.target_heading = math.radians(server_deg)
+        
+        s.updated_at = time.time()
+        db.session.commit()
+        
+        print(f"[DEBUG] Turn: {turn_deg}° -> New heading: {compass_deg:.1f}° compass")
+        
+        # Convert back to compass degrees for response
+        compass_heading = (s.heading * 180 / math.pi + 90) % 360
+        compass_target = (s.target_heading * 180 / math.pi + 90) % 360 if s.target_heading else None
+        return jsonify({'ok': True, 'submarine': dict(
+            id=s.id, 
+            heading=s.heading, 
+            target_heading=s.target_heading,
+            compass_heading=compass_heading,
+            compass_target=compass_target,
+            turn_applied=turn_deg
+        )})
 
 @app.post('/set_passive_array/<sub_id>')
 @require_key
@@ -1370,7 +1536,7 @@ def admin_state():
             rudder_angle=s.rudder_angle,rudder_cmd=s.rudder_cmd,planes=s.planes,
             speed=s.speed,battery=s.battery,is_snorkeling=s.is_snorkeling,
             blow_active=s.blow_active,blow_charge=s.blow_charge,health=s.health,
-            target_depth=s.target_depth, throttle=s.throttle, owner_id=s.owner_id
+            target_depth=s.target_depth, target_heading=s.target_heading, throttle=s.throttle, owner_id=s.owner_id
         ) for s in SubModel.query.all()]
         torps = [dict(
             id=t.id,x=t.x,y=t.y,depth=t.depth,heading=t.heading,speed=t.speed,
